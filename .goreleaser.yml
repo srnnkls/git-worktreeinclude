@@ -57,3 +57,4 @@ release:
   draft: false
   prerelease: auto
   name_template: "{{ .ProjectName }} {{ .Version }}"
+  replace_existing_artifacts: true
