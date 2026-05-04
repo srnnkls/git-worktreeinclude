@@ -717,6 +717,65 @@ func TestEngineApplyCopyModeConflictsWithExistingSymlink(t *testing.T) {
 	}
 }
 
+func TestEngineApplyAutoRefusesTargetWorktree(t *testing.T) {
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "config", "user.name", "Test User")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "branch", "-M", "main")
+	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\n")
+	writeFile(t, filepath.Join(repo, testIncludeFile), ".env\n")
+	runGit(t, repo, "add", ".gitignore", testIncludeFile)
+	runGit(t, repo, "commit", "-q", "-m", "init")
+	writeFile(t, filepath.Join(repo, ".env"), "X\n")
+
+	_, code, err := NewEngine().Apply(context.Background(), repo, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err == nil {
+		t.Fatalf("expected error when --from auto has only target worktree, got none (code=%d)", code)
+	}
+	if code != exitcode.Env {
+		t.Fatalf("exit code = %d, want %d", code, exitcode.Env)
+	}
+}
+
+func TestEngineApplyAutoSkipsTargetWhenSecondaryIsTarget(t *testing.T) {
+	fx := setupEngineFixture(t)
+
+	_, code, err := NewEngine().Apply(context.Background(), fx.root, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("exit code = %d, want %d (auto should pick fx.wt over fx.root)", code, exitcode.OK)
+	}
+}
+
+func TestEngineApplyExplicitFromEqualsTarget(t *testing.T) {
+	fx := setupEngineFixture(t)
+	e := NewEngine()
+
+	_, code, err := e.Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    fx.wt,
+		Include: testIncludeFile,
+	})
+	if err == nil {
+		t.Fatalf("expected error when --from points at target worktree, got none (code=%d)", code)
+	}
+	if code != exitcode.Env {
+		t.Fatalf("exit code = %d, want %d", code, exitcode.Env)
+	}
+}
+
 func TestErrorCodeFromCLIError(t *testing.T) {
 	err := &CLIError{Code: exitcode.Env, Msg: "x"}
 	if got := errorCode(err); got != exitcode.Env {

@@ -467,16 +467,18 @@ func (e *Engine) resolveSourceRoot(ctx context.Context, targetRoot, cwd, from st
 		if err != nil {
 			return "", &CLIError{Code: exitcode.Env, Msg: "failed to parse worktree list", Err: err}
 		}
+		targetCanon := canonicalPath(targetRoot)
 		for _, wt := range worktrees {
-			if wt.Bare {
+			if wt.Bare || wt.Path == "" {
 				continue
 			}
-			if wt.Path == "" {
+			candidate := filepath.Clean(wt.Path)
+			if canonicalPath(candidate) == targetCanon {
 				continue
 			}
-			return filepath.Clean(wt.Path), nil
+			return candidate, nil
 		}
-		return "", &CLIError{Code: exitcode.Env, Msg: "no non-bare worktree found for --from auto", Err: nil}
+		return "", &CLIError{Code: exitcode.Env, Msg: "no other non-bare worktree found for --from auto; pass --from <path> to specify the source", Err: nil}
 	}
 
 	sourcePath := from
@@ -505,7 +507,21 @@ func (e *Engine) assertSameRepository(ctx context.Context, targetRoot, sourceRoo
 	if filepath.Clean(targetCommon) != filepath.Clean(sourceCommon) {
 		return &CLIError{Code: exitcode.Env, Msg: "source and target are not from the same repository", Err: nil}
 	}
+	if canonicalPath(targetRoot) == canonicalPath(sourceRoot) {
+		return &CLIError{Code: exitcode.Env, Msg: "source and target are the same worktree; pass --from <path> to a different worktree", Err: nil}
+	}
 	return nil
+}
+
+func canonicalPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real
+	}
+	return abs
 }
 
 func (e *Engine) listIgnored(ctx context.Context, repoRoot, includePath string, excludeStandard bool) ([]string, error) {
