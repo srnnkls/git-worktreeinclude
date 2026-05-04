@@ -166,6 +166,136 @@ func TestEnsurePathWithinRootBoundaries(t *testing.T) {
 	}
 }
 
+func TestSplitPatternAndAttrs(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        string
+		wantGlob  string
+		wantAttrs []string
+	}{
+		{name: "plain glob", in: ".env", wantGlob: ".env"},
+		{name: "glob plus copy", in: ".env  copy", wantGlob: ".env", wantAttrs: []string{"copy"}},
+		{name: "glob plus symlink", in: "node_modules\tsymlink", wantGlob: "node_modules", wantAttrs: []string{"symlink"}},
+		{name: "multiple attrs", in: "*.tmp  symlink binary key=value", wantGlob: "*.tmp", wantAttrs: []string{"symlink", "binary", "key=value"}},
+		{name: "negation", in: "!secret.env", wantGlob: "!secret.env"},
+		{name: "negation with attr", in: "!secret.env  symlink", wantGlob: "!secret.env", wantAttrs: []string{"symlink"}},
+		{name: "extra spaces", in: "  .env     symlink   ", wantGlob: ".env", wantAttrs: []string{"symlink"}},
+		{name: "tabs between", in: ".env\t\tsymlink", wantGlob: ".env", wantAttrs: []string{"symlink"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotGlob, gotAttrs := splitPatternAndAttrs(strings.TrimSpace(tt.in))
+			if gotGlob != tt.wantGlob {
+				t.Fatalf("glob: want %q, got %q", tt.wantGlob, gotGlob)
+			}
+			if len(gotAttrs) != len(tt.wantAttrs) {
+				t.Fatalf("attrs len: want %d, got %d (%v)", len(tt.wantAttrs), len(gotAttrs), gotAttrs)
+			}
+			for i := range gotAttrs {
+				if gotAttrs[i] != tt.wantAttrs[i] {
+					t.Fatalf("attrs[%d]: want %q, got %q", i, tt.wantAttrs[i], gotAttrs[i])
+				}
+			}
+		})
+	}
+}
+
+func TestResolveMode(t *testing.T) {
+	tests := []struct {
+		name  string
+		attrs []string
+		want  *Mode
+	}{
+		{name: "none", attrs: nil, want: nil},
+		{name: "only unknowns", attrs: []string{"binary", "export-ignore", "eol=lf"}, want: nil},
+		{name: "explicit copy", attrs: []string{"copy"}, want: ptrMode(ModeCopy)},
+		{name: "explicit symlink", attrs: []string{"symlink"}, want: ptrMode(ModeSymlink)},
+		{name: "symlink wins over copy", attrs: []string{"copy", "symlink"}, want: ptrMode(ModeSymlink)},
+		{name: "symlink with unknown trailing", attrs: []string{"symlink", "binary"}, want: ptrMode(ModeSymlink)},
+		{name: "copy with unknown trailing", attrs: []string{"binary", "copy", "key=val"}, want: ptrMode(ModeCopy)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveMode(tt.attrs)
+			if (got == nil) != (tt.want == nil) {
+				t.Fatalf("nil-ness mismatch: want %v, got %v", tt.want, got)
+			}
+			if got != nil && *got != *tt.want {
+				t.Fatalf("want %v, got %v", *tt.want, *got)
+			}
+		})
+	}
+}
+
+func TestParseIncludeFileBackwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	includePath := filepath.Join(dir, ".worktreeinclude")
+	if err := os.WriteFile(includePath, []byte("# legacy file\n.env\n.env.local\n!.env.example\n"), 0o644); err != nil {
+		t.Fatalf("write include: %v", err)
+	}
+
+	patterns, err := parseIncludeFile(includePath)
+	if err != nil {
+		t.Fatalf("parseIncludeFile: %v", err)
+	}
+	if len(patterns) != 3 {
+		t.Fatalf("expected 3 patterns, got %d", len(patterns))
+	}
+	for _, p := range patterns {
+		if p.Mode != nil {
+			t.Fatalf("expected Mode=nil for attribute-free line %q, got %v", p.Glob, *p.Mode)
+		}
+	}
+	if patterns[2].Glob != "!.env.example" || !patterns[2].Negation {
+		t.Fatalf("expected leading-! negation pattern, got %+v", patterns[2])
+	}
+}
+
+func TestParseIncludeFileWithAttributes(t *testing.T) {
+	dir := t.TempDir()
+	includePath := filepath.Join(dir, ".worktreeinclude")
+	contents := strings.Join([]string{
+		"# attributes example",
+		".env                copy",
+		"node_modules        symlink",
+		"package-lock.json   binary",
+		"tests/fixtures/**   export-ignore",
+		"!secret.env         symlink",
+		"",
+	}, "\n")
+	if err := os.WriteFile(includePath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write include: %v", err)
+	}
+
+	patterns, err := parseIncludeFile(includePath)
+	if err != nil {
+		t.Fatalf("parseIncludeFile: %v", err)
+	}
+	if len(patterns) != 5 {
+		t.Fatalf("expected 5 patterns, got %d", len(patterns))
+	}
+
+	if patterns[0].Mode == nil || *patterns[0].Mode != ModeCopy {
+		t.Fatalf("expected explicit copy on .env, got %v", patterns[0].Mode)
+	}
+	if patterns[1].Mode == nil || *patterns[1].Mode != ModeSymlink {
+		t.Fatalf("expected symlink on node_modules, got %v", patterns[1].Mode)
+	}
+	if patterns[2].Mode != nil {
+		t.Fatalf("unknown attr should leave Mode=nil, got %v", *patterns[2].Mode)
+	}
+	if patterns[3].Mode != nil {
+		t.Fatalf("unknown attr should leave Mode=nil, got %v", *patterns[3].Mode)
+	}
+	if patterns[4].Mode == nil || *patterns[4].Mode != ModeSymlink || !patterns[4].Negation {
+		t.Fatalf("expected !secret.env to be symlink-bucket negation, got %+v", patterns[4])
+	}
+}
+
+func ptrMode(m Mode) *Mode { return &m }
+
 func TestEnsurePathWithinRootRejectsSymlinkEscape(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation may require elevated privileges on Windows")

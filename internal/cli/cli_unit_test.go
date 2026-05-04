@@ -123,6 +123,43 @@ func TestFormatActionLine(t *testing.T) {
 			action: engine.Action{Op: "skip", Path: ".env", Status: "same"},
 			want:   "SKIP      .env (same)",
 		},
+		{
+			name:   "skip same link",
+			action: engine.Action{Op: "skip", Path: ".env", Status: "same_link"},
+			want:   "SKIP      .env (same link)",
+		},
+		{
+			name:   "symlink planned",
+			action: engine.Action{Op: "symlink", Path: "node_modules", Status: "planned"},
+			want:   "LINK      node_modules (dry-run)",
+		},
+		{
+			name:   "symlink done",
+			action: engine.Action{Op: "symlink", Path: "node_modules", Status: "done"},
+			want:   "LINK      node_modules",
+		},
+		{
+			name:   "symlink error",
+			action: engine.Action{Op: "symlink", Path: "node_modules", Status: "error"},
+			want:   "ERROR     node_modules (symlink failed)",
+		},
+		{
+			name:   "conflict diff_link without force",
+			action: engine.Action{Op: "conflict", Path: ".env", Status: "diff_link"},
+			want:   "CONFLICT  .env (differs; use --force)",
+		},
+		{
+			name:   "conflict diff_link with force",
+			action: engine.Action{Op: "conflict", Path: ".env", Status: "diff_link"},
+			force:  true,
+			want:   "LINK      .env",
+		},
+		{
+			name:   "conflict diff with force",
+			action: engine.Action{Op: "conflict", Path: ".env", Status: "diff"},
+			force:  true,
+			want:   "COPY      .env",
+		},
 	}
 
 	for _, tt := range tests {

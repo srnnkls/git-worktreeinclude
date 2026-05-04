@@ -56,6 +56,49 @@ Example for a typical app repo with local env, editor settings, and tool-specifi
 turbo/.cache/
 ```
 
+### Per-pattern attributes
+
+Each line may carry trailing whitespace-separated attributes after the glob:
+
+```
+<glob>   [attr ...]
+```
+
+Recognized attributes:
+
+- `copy` (default): the matched path is byte-copied into the target worktree.
+- `symlink`: the target gets a symlink pointing at the absolute path of the source file in the source worktree.
+
+If both `copy` and `symlink` appear on the same line, `symlink` wins. Unknown attributes (e.g. `binary`, `eol=lf`, `export-ignore`, `key=value`) are accepted and ignored, so this file format stays forward-compatible and can sit next to (or share content with) `.gitattributes`-style metadata.
+
+Example:
+
+```gitignore
+# Default: copy
+.env
+.env.local
+
+# Share large directories instead of duplicating per worktree
+node_modules        symlink
+.cache/             symlink
+
+# Forward-compat tokens (no effect today)
+package-lock.json   binary
+tests/fixtures/**   export-ignore
+```
+
+Symlink mode notes:
+
+- The link target is an absolute path to the source file. If the source worktree is later moved or removed, the link will dangle.
+- Pre-existing destinations:
+  - already a symlink to the same source: skipped as `same link`
+  - already a symlink to a different target: conflict; `--force` replaces
+  - already a regular file: conflict; `--force` replaces
+  - already a directory: conflict
+- A pattern resolved as `copy` will also conflict if the destination already exists as a symlink (matches symlink-mode strictness; `--force` replaces with a regular file).
+- Globs cannot contain whitespace (no quoting): the first whitespace run separates pattern from attributes.
+- "Any matching `symlink` pattern wins": if a path matches both a copy-mode pattern and a symlink-mode pattern, it is symlinked. Negation lines (`!foo`) are honored within the symlink set the same way they are in a regular gitignore file.
+
 ## Commands
 
 ### `git-worktreeinclude --version`
@@ -81,7 +124,7 @@ git-worktreeinclude apply [--from auto|<path>] [--include <path>] [--dry-run] [-
   - absolute path: must be inside source worktree root
 - `--dry-run`: plan only, make no changes
   - use `--dry-run --verbose` when you want diagnostics about source/target selection, include file resolution, and planned actions
-  - in dry-run mode, the human-readable summary uses `copy_planned=` instead of `copied=`, and the JSON summary uses `"copy_planned"` instead of `"copied"`
+  - in dry-run mode, the human-readable summary uses `copy_planned=` / `symlink_planned=` instead of `copied=` / `symlinked=`, and the JSON summary uses `"copy_planned"` / `"symlink_planned"` instead of `"copied"` / `"symlinked"`
 - `--force`: overwrite differing target files
 - `--json`: emit a single JSON object to stdout
 - `--quiet`: suppress human-readable output
@@ -109,6 +152,7 @@ Normal execution (`apply --json`):
   "summary": {
     "matched": 12,
     "copied": 8,
+    "symlinked": 1,
     "skipped_same": 3,
     "skipped_missing_src": 1,
     "conflicts": 0,
@@ -116,6 +160,7 @@ Normal execution (`apply --json`):
   },
   "actions": [
     {"op": "copy", "path": ".env", "status": "done"},
+    {"op": "symlink", "path": "node_modules", "status": "done"},
     {"op": "skip", "path": ".mise.local.toml", "status": "same"},
     {"op": "conflict", "path": ".vscode/settings.json", "status": "diff"}
   ]
@@ -133,6 +178,7 @@ Dry-run mode (`apply --dry-run --json`):
   "summary": {
     "matched": 12,
     "copy_planned": 8,
+    "symlink_planned": 1,
     "skipped_same": 3,
     "skipped_missing_src": 1,
     "conflicts": 0,
@@ -140,6 +186,7 @@ Dry-run mode (`apply --dry-run --json`):
   },
   "actions": [
     {"op": "copy", "path": ".env", "status": "planned"},
+    {"op": "symlink", "path": "node_modules", "status": "planned"},
     {"op": "skip", "path": ".mise.local.toml", "status": "same"},
     {"op": "conflict", "path": ".vscode/settings.json", "status": "diff"}
   ]
@@ -147,7 +194,10 @@ Dry-run mode (`apply --dry-run --json`):
 ```
 
 - `"dry_run": true` indicates no files were written
-- In dry-run mode `"copy_planned"` is used instead of `"copied"` in the summary (they are mutually exclusive)
+- In dry-run mode `"copy_planned"` / `"symlink_planned"` are used instead of `"copied"` / `"symlinked"` in the summary (they are mutually exclusive)
+- `op` is one of `copy`, `symlink`, `skip`, `conflict`
+- `status` for `skip` includes `same`, `same_link`, `missing_src`, `symlink` (source is a symlink), `error`
+- `status` for `conflict` is `diff` (copy mode) or `diff_link` (symlink mode)
 - `path` is repo-root relative and slash-separated
 - File contents and secrets are never output
 

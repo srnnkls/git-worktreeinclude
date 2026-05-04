@@ -59,6 +59,8 @@ type jsonResult struct {
 		Matched           int `json:"matched"`
 		Copied            int `json:"copied"`
 		CopyPlanned       int `json:"copy_planned"`
+		Symlinked         int `json:"symlinked"`
+		SymlinkPlanned    int `json:"symlink_planned"`
 		SkippedSame       int `json:"skipped_same"`
 		SkippedMissingSrc int `json:"skipped_missing_src"`
 		Conflicts         int `json:"conflicts"`
@@ -69,6 +71,96 @@ type jsonResult struct {
 		Path   string `json:"path"`
 		Status string `json:"status"`
 	} `json:"actions"`
+}
+
+func TestApplySymlinkHumanOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupFixture(t)
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), ".env  symlink\n.env.local\n")
+
+	stdout, stderr, code := runCmd(t, fx.wt, nil, testBinary, "apply", "--from", "auto", "--include", testIncludeFile)
+	if code != 0 {
+		t.Fatalf("apply exit code = %d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "LINK      .env") {
+		t.Fatalf("expected LINK line for .env: %s", stdout)
+	}
+	if !strings.Contains(stdout, "symlinked=1") {
+		t.Fatalf("expected symlinked=1 in summary: %s", stdout)
+	}
+	if !strings.Contains(stdout, "copied=1") {
+		t.Fatalf("expected copied=1 in summary: %s", stdout)
+	}
+	info, err := os.Lstat(filepath.Join(fx.wt, ".env"))
+	if err != nil {
+		t.Fatalf("lstat .env: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected .env to be a symlink, got mode=%v", info.Mode())
+	}
+}
+
+func TestApplySymlinkJSONShape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupFixture(t)
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), ".env  symlink\n.env.local\n")
+
+	stdout, stderr, code := runCmd(t, fx.wt, nil, testBinary, "apply", "--from", "auto", "--include", testIncludeFile, "--json")
+	if code != 0 {
+		t.Fatalf("apply --json exit code = %d stderr=%s", code, stderr)
+	}
+	res := decodeSingleJSON(t, stdout)
+	if res.Summary.Symlinked != 1 {
+		t.Fatalf("expected symlinked=1 in JSON, got summary=%+v", res.Summary)
+	}
+	if res.Summary.Copied != 1 {
+		t.Fatalf("expected copied=1 in JSON, got summary=%+v", res.Summary)
+	}
+
+	var foundLink bool
+	for _, a := range res.Actions {
+		if a.Path == ".env" {
+			if a.Op != "symlink" || a.Status != "done" {
+				t.Fatalf("expected symlink/done for .env, got %+v", a)
+			}
+			foundLink = true
+		}
+	}
+	if !foundLink {
+		t.Fatalf("expected a symlink action in JSON: %+v", res.Actions)
+	}
+}
+
+func TestApplySymlinkDryRunOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupFixture(t)
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), ".env  symlink\n.env.local\n")
+
+	stdout, stderr, code := runCmd(t, fx.wt, nil, testBinary, "apply", "--from", "auto", "--include", testIncludeFile, "--dry-run")
+	if code != 0 {
+		t.Fatalf("apply --dry-run exit code = %d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "LINK      .env (dry-run)") {
+		t.Fatalf("expected dry-run LINK line for .env: %s", stdout)
+	}
+	if !strings.Contains(stdout, "symlink_planned=1") {
+		t.Fatalf("expected symlink_planned=1 in summary: %s", stdout)
+	}
+	if strings.Contains(stdout, "symlinked=") {
+		t.Fatalf("dry-run should not emit symlinked=: %s", stdout)
+	}
+	if _, err := os.Lstat(filepath.Join(fx.wt, ".env")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run should not create .env, err=%v", err)
+	}
 }
 
 func TestApplyAC1AC2AC6AC7(t *testing.T) {

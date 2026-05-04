@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -28,6 +27,8 @@ type Summary struct {
 	Matched           int `json:"matched"`
 	Copied            int `json:"copied,omitempty"`
 	CopyPlanned       int `json:"copy_planned,omitempty"`
+	Symlinked         int `json:"symlinked,omitempty"`
+	SymlinkPlanned    int `json:"symlink_planned,omitempty"`
 	SkippedSame       int `json:"skipped_same"`
 	SkippedMissingSrc int `json:"skipped_missing_src"`
 	Conflicts         int `json:"conflicts"`
@@ -104,6 +105,7 @@ type prepared struct {
 	targetIncludePath  string
 	patternCount       int
 	matched            []string
+	symlinkSet         map[string]struct{}
 }
 
 const (
@@ -146,7 +148,6 @@ func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int
 		return result, exitcode.OK
 	}
 
-	executeCopies := !dryRun
 	for _, rel := range prep.matched {
 		srcPath, err := secureJoin(prep.sourceRoot, rel)
 		if err != nil {
@@ -184,72 +185,10 @@ func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int
 			continue
 		}
 
-		dstInfo, err := os.Lstat(dstPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
-			result.Summary.Errors++
-			continue
-		}
-
-		if errors.Is(err, os.ErrNotExist) {
-			status := "planned"
-			if executeCopies {
-				if err := copyFileAtomic(prep.targetRoot, srcPath, dstPath, srcInfo.Mode().Perm()); err != nil {
-					result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: "error"})
-					result.Summary.Errors++
-					continue
-				}
-				status = "done"
-			}
-			result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: status})
-			if dryRun {
-				result.Summary.CopyPlanned++
-			} else {
-				result.Summary.Copied++
-			}
-			continue
-		}
-
-		if dstInfo.IsDir() {
-			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
-			result.Summary.Conflicts++
-			continue
-		}
-
-		if dstInfo.Mode()&os.ModeSymlink == 0 {
-			same, err := filesSame(srcPath, dstPath)
-			if err != nil {
-				result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
-				result.Summary.Errors++
-				continue
-			}
-			if same {
-				result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "same"})
-				result.Summary.SkippedSame++
-				continue
-			}
-		}
-
-		if !force {
-			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
-			result.Summary.Conflicts++
-			continue
-		}
-
-		status := "planned"
-		if executeCopies {
-			if err := copyFileAtomic(prep.targetRoot, srcPath, dstPath, srcInfo.Mode().Perm()); err != nil {
-				result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: "error"})
-				result.Summary.Errors++
-				continue
-			}
-			status = "done"
-		}
-		result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: status})
-		if dryRun {
-			result.Summary.CopyPlanned++
+		if _, ok := prep.symlinkSet[rel]; ok {
+			applySymlink(&result, prep.targetRoot, rel, srcPath, dstPath, dryRun, force)
 		} else {
-			result.Summary.Copied++
+			applyCopy(&result, prep.targetRoot, rel, srcPath, dstPath, srcInfo.Mode().Perm(), dryRun, force)
 		}
 	}
 
@@ -260,6 +199,143 @@ func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int
 		return result, exitcode.Conflict
 	}
 	return result, exitcode.OK
+}
+
+func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os.FileMode, dryRun, force bool) {
+	dstInfo, err := os.Lstat(dstPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+		result.Summary.Errors++
+		return
+	}
+
+	if errors.Is(err, os.ErrNotExist) {
+		recordCopy(result, targetRoot, rel, srcPath, dstPath, perm, dryRun)
+		return
+	}
+
+	if dstInfo.IsDir() {
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
+		result.Summary.Conflicts++
+		return
+	}
+
+	if dstInfo.Mode()&os.ModeSymlink != 0 {
+		// Existing symlink at the destination is treated as a conflict in copy
+		// mode so behavior matches symlink mode and so we don't silently
+		// resolve through the link.
+		if !force {
+			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
+			result.Summary.Conflicts++
+			return
+		}
+		recordCopy(result, targetRoot, rel, srcPath, dstPath, perm, dryRun)
+		return
+	}
+
+	same, err := filesSame(srcPath, dstPath)
+	if err != nil {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+		result.Summary.Errors++
+		return
+	}
+	if same {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "same"})
+		result.Summary.SkippedSame++
+		return
+	}
+
+	if !force {
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
+		result.Summary.Conflicts++
+		return
+	}
+
+	recordCopy(result, targetRoot, rel, srcPath, dstPath, perm, dryRun)
+}
+
+func recordCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os.FileMode, dryRun bool) {
+	status := "planned"
+	if !dryRun {
+		if err := copyFileAtomic(targetRoot, srcPath, dstPath, perm); err != nil {
+			result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: "error"})
+			result.Summary.Errors++
+			return
+		}
+		status = "done"
+	}
+	result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: status})
+	if dryRun {
+		result.Summary.CopyPlanned++
+	} else {
+		result.Summary.Copied++
+	}
+}
+
+func applySymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryRun, force bool) {
+	dstInfo, err := os.Lstat(dstPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+		result.Summary.Errors++
+		return
+	}
+
+	if errors.Is(err, os.ErrNotExist) {
+		recordSymlink(result, targetRoot, rel, srcPath, dstPath, dryRun)
+		return
+	}
+
+	if dstInfo.IsDir() {
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff_link"})
+		result.Summary.Conflicts++
+		return
+	}
+
+	if dstInfo.Mode()&os.ModeSymlink != 0 {
+		same, err := symlinkPointsTo(dstPath, srcPath)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+			result.Summary.Errors++
+			return
+		}
+		if same {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "same_link"})
+			result.Summary.SkippedSame++
+			return
+		}
+		if !force {
+			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff_link"})
+			result.Summary.Conflicts++
+			return
+		}
+		recordSymlink(result, targetRoot, rel, srcPath, dstPath, dryRun)
+		return
+	}
+
+	if !force {
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff_link"})
+		result.Summary.Conflicts++
+		return
+	}
+	recordSymlink(result, targetRoot, rel, srcPath, dstPath, dryRun)
+}
+
+func recordSymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryRun bool) {
+	status := "planned"
+	if !dryRun {
+		if err := symlinkAtomic(targetRoot, srcPath, dstPath); err != nil {
+			result.Actions = append(result.Actions, Action{Op: "symlink", Path: rel, Status: "error"})
+			result.Summary.Errors++
+			return
+		}
+		status = "done"
+	}
+	result.Actions = append(result.Actions, Action{Op: "symlink", Path: rel, Status: status})
+	if dryRun {
+		result.Summary.SymlinkPlanned++
+	} else {
+		result.Summary.Symlinked++
+	}
 }
 
 func (e *Engine) prepare(ctx context.Context, cwd, fromOpt, includeOpt string) (prepared, error) {
@@ -326,22 +402,50 @@ func (e *Engine) prepare(ctx context.Context, cwd, fromOpt, includeOpt string) (
 		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "include path is a directory", Err: nil}
 	}
 
-	patternCount, err := countPatterns(includePath)
+	patterns, err := parseIncludeFile(includePath)
 	if err != nil {
 		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to parse include file", Err: err}
 	}
-	prep.patternCount = patternCount
+	prep.patternCount = len(patterns)
 	prep.includeFound = true
+
+	tmpDir, err := os.MkdirTemp("", "git-worktreeinclude-include-")
+	if err != nil {
+		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to create include scratch dir", Err: err}
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	sanitizedPath, err := writeSanitizedInclude(tmpDir, patterns)
+	if err != nil {
+		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to write sanitized include file", Err: err}
+	}
 
 	ignored, err := e.listIgnored(ctx, sourceRoot, "", true)
 	if err != nil {
 		return prepared{}, err
 	}
-	included, err := e.listIgnored(ctx, sourceRoot, includePath, false)
+	included, err := e.listIgnored(ctx, sourceRoot, sanitizedPath, false)
 	if err != nil {
 		return prepared{}, err
 	}
 	prep.matched = intersectPaths(ignored, included)
+
+	subsetPath, err := writeSymlinkSubsetInclude(tmpDir, patterns)
+	if err != nil {
+		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to write symlink-subset include file", Err: err}
+	}
+	if subsetPath != "" {
+		symlinkPaths, err := e.listIgnored(ctx, sourceRoot, subsetPath, false)
+		if err != nil {
+			return prepared{}, err
+		}
+		prep.symlinkSet = make(map[string]struct{}, len(symlinkPaths))
+		for _, p := range symlinkPaths {
+			prep.symlinkSet[p] = struct{}{}
+		}
+	}
 	return prep, nil
 }
 
@@ -428,28 +532,11 @@ func (e *Engine) listIgnored(ctx context.Context, repoRoot, includePath string, 
 }
 
 func countPatterns(includePath string) (int, error) {
-	f, err := os.Open(includePath)
+	patterns, err := parseIncludeFile(includePath)
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	s := bufio.NewScanner(f)
-	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	count := 0
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		count++
-	}
-	if err := s.Err(); err != nil {
-		return 0, err
-	}
-	return count, nil
+	return len(patterns), nil
 }
 
 type worktreeEntry struct {
@@ -675,6 +762,53 @@ func copyFileAtomic(targetRoot, srcPath, dstPath string, perm os.FileMode) error
 	}
 
 	return nil
+}
+
+func symlinkAtomic(targetRoot, srcAbs, dstPath string) error {
+	parent := filepath.Dir(dstPath)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	if err := ensurePathWithinRoot(targetRoot, parent); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(parent, ".git-worktreeinclude-link-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// CreateTemp leaves a file at tmpName; remove it so Symlink can create
+	// a link in its place.
+	if err := os.Remove(tmpName); err != nil {
+		return err
+	}
+	if err := os.Symlink(srcAbs, tmpName); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dstPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func symlinkPointsTo(dstPath, wantSrcAbs string) (bool, error) {
+	gotResolved, gotErr := filepath.EvalSymlinks(dstPath)
+	wantResolved, wantErr := filepath.EvalSymlinks(wantSrcAbs)
+	if gotErr == nil && wantErr == nil {
+		return filepath.Clean(gotResolved) == filepath.Clean(wantResolved), nil
+	}
+
+	raw, err := os.Readlink(dstPath)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(raw) == filepath.Clean(wantSrcAbs), nil
 }
 
 func ensurePathWithinRoot(root, candidate string) error {

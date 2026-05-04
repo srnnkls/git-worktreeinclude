@@ -162,9 +162,10 @@ func (a *App) runApply(ctx context.Context, cmd *ucli.Command) error {
 			if dryRun {
 				writef(
 					a.stdout,
-					"SUMMARY matched=%d copy_planned=%d skipped_same=%d skipped_missing_src=%d conflicts=%d errors=%d\n",
+					"SUMMARY matched=%d copy_planned=%d symlink_planned=%d skipped_same=%d skipped_missing_src=%d conflicts=%d errors=%d\n",
 					result.Summary.Matched,
 					result.Summary.CopyPlanned,
+					result.Summary.SymlinkPlanned,
 					result.Summary.SkippedSame,
 					result.Summary.SkippedMissingSrc,
 					result.Summary.Conflicts,
@@ -173,9 +174,10 @@ func (a *App) runApply(ctx context.Context, cmd *ucli.Command) error {
 			} else {
 				writef(
 					a.stdout,
-					"SUMMARY matched=%d copied=%d skipped_same=%d skipped_missing_src=%d conflicts=%d errors=%d\n",
+					"SUMMARY matched=%d copied=%d symlinked=%d skipped_same=%d skipped_missing_src=%d conflicts=%d errors=%d\n",
 					result.Summary.Matched,
 					result.Summary.Copied,
+					result.Summary.Symlinked,
 					result.Summary.SkippedSame,
 					result.Summary.SkippedMissingSrc,
 					result.Summary.Conflicts,
@@ -241,8 +243,19 @@ func formatActionLine(action engine.Action, force bool) string {
 			return fmt.Sprintf("ERROR     %s (copy failed)", action.Path)
 		}
 		return fmt.Sprintf("COPY      %s", action.Path)
+	case "symlink":
+		if action.Status == "planned" {
+			return fmt.Sprintf("LINK      %s (dry-run)", action.Path)
+		}
+		if action.Status == "error" {
+			return fmt.Sprintf("ERROR     %s (symlink failed)", action.Path)
+		}
+		return fmt.Sprintf("LINK      %s", action.Path)
 	case "conflict":
 		if force {
+			if action.Status == "diff_link" {
+				return fmt.Sprintf("LINK      %s", action.Path)
+			}
 			return fmt.Sprintf("COPY      %s", action.Path)
 		}
 		return fmt.Sprintf("CONFLICT  %s (differs; use --force)", action.Path)
@@ -250,6 +263,8 @@ func formatActionLine(action engine.Action, force bool) string {
 		switch action.Status {
 		case "same":
 			return fmt.Sprintf("SKIP      %s (same)", action.Path)
+		case "same_link":
+			return fmt.Sprintf("SKIP      %s (same link)", action.Path)
 		case "missing_src":
 			return fmt.Sprintf("SKIP      %s (missing source)", action.Path)
 		case "symlink":
