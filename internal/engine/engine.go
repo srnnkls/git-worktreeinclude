@@ -175,8 +175,14 @@ func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int
 		}
 
 		if srcInfo.Mode()&os.ModeSymlink != 0 {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "symlink"})
-			result.Summary.SkippedMissingSrc++
+			linkTarget, err := os.Readlink(srcPath)
+			if err != nil {
+				result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+				result.Summary.Errors++
+				continue
+			}
+			linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
+			applySymlink(&result, prep.targetRoot, rel, linkTarget, dstPath, dryRun, force)
 			continue
 		}
 		if !srcInfo.Mode().IsRegular() {
@@ -272,7 +278,7 @@ func recordCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm o
 	}
 }
 
-func applySymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryRun, force bool) {
+func applySymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, dryRun, force bool) {
 	dstInfo, err := os.Lstat(dstPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
@@ -281,7 +287,7 @@ func applySymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryR
 	}
 
 	if errors.Is(err, os.ErrNotExist) {
-		recordSymlink(result, targetRoot, rel, srcPath, dstPath, dryRun)
+		recordSymlink(result, targetRoot, rel, linkTarget, dstPath, dryRun)
 		return
 	}
 
@@ -292,7 +298,7 @@ func applySymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryR
 	}
 
 	if dstInfo.Mode()&os.ModeSymlink != 0 {
-		same, err := symlinkPointsTo(dstPath, srcPath)
+		same, err := symlinkPointsTo(dstPath, linkTarget)
 		if err != nil {
 			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
 			result.Summary.Errors++
@@ -308,7 +314,7 @@ func applySymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryR
 			result.Summary.Conflicts++
 			return
 		}
-		recordSymlink(result, targetRoot, rel, srcPath, dstPath, dryRun)
+		recordSymlink(result, targetRoot, rel, linkTarget, dstPath, dryRun)
 		return
 	}
 
@@ -317,13 +323,13 @@ func applySymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryR
 		result.Summary.Conflicts++
 		return
 	}
-	recordSymlink(result, targetRoot, rel, srcPath, dstPath, dryRun)
+	recordSymlink(result, targetRoot, rel, linkTarget, dstPath, dryRun)
 }
 
-func recordSymlink(result *Result, targetRoot, rel, srcPath, dstPath string, dryRun bool) {
+func recordSymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, dryRun bool) {
 	status := "planned"
 	if !dryRun {
-		if err := symlinkAtomic(targetRoot, srcPath, dstPath); err != nil {
+		if err := symlinkAtomic(targetRoot, linkTarget, dstPath); err != nil {
 			result.Actions = append(result.Actions, Action{Op: "symlink", Path: rel, Status: "error"})
 			result.Summary.Errors++
 			return
@@ -780,7 +786,7 @@ func copyFileAtomic(targetRoot, srcPath, dstPath string, perm os.FileMode) error
 	return nil
 }
 
-func symlinkAtomic(targetRoot, srcAbs, dstPath string) error {
+func symlinkAtomic(targetRoot, linkTarget, dstPath string) error {
 	parent := filepath.Dir(dstPath)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -803,7 +809,7 @@ func symlinkAtomic(targetRoot, srcAbs, dstPath string) error {
 	if err := os.Remove(tmpName); err != nil {
 		return err
 	}
-	if err := os.Symlink(srcAbs, tmpName); err != nil {
+	if err := os.Symlink(linkTarget, tmpName); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, dstPath); err != nil {
@@ -813,18 +819,47 @@ func symlinkAtomic(targetRoot, srcAbs, dstPath string) error {
 	return nil
 }
 
-func symlinkPointsTo(dstPath, wantSrcAbs string) (bool, error) {
-	gotResolved, gotErr := filepath.EvalSymlinks(dstPath)
-	wantResolved, wantErr := filepath.EvalSymlinks(wantSrcAbs)
-	if gotErr == nil && wantErr == nil {
-		return filepath.Clean(gotResolved) == filepath.Clean(wantResolved), nil
-	}
-
+func symlinkPointsTo(dstPath, wantLinkTarget string) (bool, error) {
 	raw, err := os.Readlink(dstPath)
 	if err != nil {
 		return false, err
 	}
-	return filepath.Clean(raw) == filepath.Clean(wantSrcAbs), nil
+	if filepath.Clean(raw) == filepath.Clean(wantLinkTarget) {
+		return true, nil
+	}
+
+	wantAbs := wantLinkTarget
+	if !filepath.IsAbs(wantAbs) {
+		wantAbs = filepath.Join(filepath.Dir(dstPath), wantAbs)
+	}
+	gotResolved, gotErr := filepath.EvalSymlinks(dstPath)
+	wantResolved, wantErr := filepath.EvalSymlinks(wantAbs)
+	if gotErr == nil && wantErr == nil {
+		return filepath.Clean(gotResolved) == filepath.Clean(wantResolved), nil
+	}
+	return false, nil
+}
+
+// rewriteAbsoluteLinkTarget rewrites absolute link targets that lie inside
+// the source root to the equivalent path under the target root, so a
+// recreated link does not reach back into the source worktree. Relative
+// targets and absolute targets pointing outside the source root are
+// returned unchanged. Both sides are canonicalized (e.g. /var vs
+// /private/var on macOS) before comparison.
+func rewriteAbsoluteLinkTarget(linkTarget, sourceRoot, targetRoot string) string {
+	if !filepath.IsAbs(linkTarget) {
+		return linkTarget
+	}
+	canonSource := canonicalPath(sourceRoot)
+	canonTarget := canonicalPath(linkTarget)
+	rel, err := filepath.Rel(canonSource, canonTarget)
+	if err != nil {
+		return linkTarget
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return linkTarget
+	}
+	return filepath.Join(targetRoot, rel)
 }
 
 func ensurePathWithinRoot(root, candidate string) error {

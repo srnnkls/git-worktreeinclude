@@ -99,6 +99,16 @@ Symlink mode notes:
 - Globs cannot contain whitespace (no quoting): the first whitespace run separates pattern from attributes.
 - "Any matching `symlink` pattern wins": if a path matches both a copy-mode pattern and a symlink-mode pattern, it is symlinked. Negation lines (`!foo`) are honored within the symlink set the same way they are in a regular gitignore file.
 
+### Source symlinks
+
+If a matched source path is itself a symlink, it is recreated at the destination as a symlink with the same link semantics, regardless of any `copy`/`symlink` attribute on the pattern:
+
+- Relative link targets are preserved verbatim (`.codex -> .claude` in source becomes `.codex -> .claude` in target).
+- Absolute link targets pointing inside the source worktree are rewritten to the equivalent path under the target worktree, so the recreated link does not reach back into the source.
+- Absolute link targets pointing outside the source worktree are preserved verbatim.
+
+Conflict, same-link, dry-run, and `--force` semantics for recreated source-symlinks match symlink mode above.
+
 ## Commands
 
 ### `git-worktreeinclude --version`
@@ -196,7 +206,7 @@ Dry-run mode (`apply --dry-run --json`):
 - `"dry_run": true` indicates no files were written
 - In dry-run mode `"copy_planned"` / `"symlink_planned"` are used instead of `"copied"` / `"symlinked"` in the summary (they are mutually exclusive)
 - `op` is one of `copy`, `symlink`, `skip`, `conflict`
-- `status` for `skip` includes `same`, `same_link`, `missing_src`, `symlink` (source is a symlink), `error`
+- `status` for `skip` includes `same`, `same_link`, `missing_src`, `error`
 - `status` for `conflict` is `diff` (copy mode) or `diff_link` (symlink mode)
 - `path` is repo-root relative and slash-separated
 - File contents and secrets are never output

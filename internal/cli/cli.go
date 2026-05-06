@@ -267,8 +267,6 @@ func formatActionLine(action engine.Action, force bool) string {
 			return fmt.Sprintf("SKIP      %s (same link)", action.Path)
 		case "missing_src":
 			return fmt.Sprintf("SKIP      %s (missing source)", action.Path)
-		case "symlink":
-			return fmt.Sprintf("SKIP      %s (source symlink)", action.Path)
 		default:
 			return fmt.Sprintf("ERROR     %s (processing failed)", action.Path)
 		}

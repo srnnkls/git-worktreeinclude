@@ -125,7 +125,7 @@ func TestEngineApplySkipsSameContent(t *testing.T) {
 	}
 }
 
-func TestEngineApplySkipsSourceSymlink(t *testing.T) {
+func TestEngineApplyRecreatesRelativeSourceSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior and permissions vary on Windows")
 	}
@@ -136,8 +136,8 @@ func TestEngineApplySkipsSourceSymlink(t *testing.T) {
 	if err := os.Remove(filepath.Join(fx.root, ".env")); err != nil {
 		t.Fatalf("remove source .env: %v", err)
 	}
-	if err := os.Symlink(filepath.Join(fx.root, ".env.local"), filepath.Join(fx.root, ".env")); err != nil {
-		t.Fatalf("create source symlink: %v", err)
+	if err := os.Symlink(".env.local", filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("create relative source symlink: %v", err)
 	}
 
 	res, code, err := e.Apply(context.Background(), fx.wt, ApplyOptions{
@@ -150,14 +150,240 @@ func TestEngineApplySkipsSourceSymlink(t *testing.T) {
 	if code != exitcode.OK {
 		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
 	}
-	if res.Summary.SkippedMissingSrc != 1 {
-		t.Fatalf("expected symlink source to be skipped, got %+v", res.Summary)
+	if res.Summary.Symlinked != 1 {
+		t.Fatalf("expected 1 symlinked, got %+v", res.Summary)
 	}
-	if action := findAction(t, res.Actions, ".env"); action.Status != "symlink" || action.Op != "skip" {
-		t.Fatalf("expected .env symlink to be skipped, got %+v", action)
+	if action := findAction(t, res.Actions, ".env"); action.Op != "symlink" || action.Status != "done" {
+		t.Fatalf("expected symlink/done for .env, got %+v", action)
+	}
+	dst := filepath.Join(fx.wt, ".env")
+	info, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatalf("lstat recreated .env: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf(".env should be a symlink, got mode=%v", info.Mode())
+	}
+	got, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if got != ".env.local" {
+		t.Fatalf("expected verbatim relative target %q, got %q", ".env.local", got)
+	}
+}
+
+func TestEngineApplyRewritesAbsoluteInSourceSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	e := NewEngine()
+
+	if err := os.Remove(filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("remove source .env: %v", err)
+	}
+	absInside := filepath.Join(fx.root, ".env.local")
+	if err := os.Symlink(absInside, filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("create absolute-inside-source symlink: %v", err)
+	}
+
+	res, code, err := e.Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+	if res.Summary.Symlinked != 1 {
+		t.Fatalf("expected 1 symlinked, got %+v", res.Summary)
+	}
+	dst := filepath.Join(fx.wt, ".env")
+	got, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("expected rewritten absolute target, got %q", got)
+	}
+	// Link must resolve into the target worktree's .env.local, not the
+	// source worktree's, so the worktree stays self-contained.
+	if !sameFile(t, dst, filepath.Join(fx.wt, ".env.local")) {
+		t.Fatalf("recreated link should resolve to target's .env.local, readlink=%q", got)
+	}
+	if sameFileWeak(t, got, absInside) {
+		t.Fatalf("recreated link should not point back into source, readlink=%q", got)
+	}
+}
+
+// sameFileWeak compares two raw paths textually after Clean, without
+// dereferencing them. Used when one of the paths may not exist.
+func sameFileWeak(t *testing.T, a, b string) bool {
+	t.Helper()
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func TestEngineApplyPreservesAbsoluteOutOfSourceSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	e := NewEngine()
+
+	external := filepath.Join(t.TempDir(), "elsewhere.env")
+	writeFile(t, external, "EXTERNAL\n")
+	if err := os.Remove(filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("remove source .env: %v", err)
+	}
+	if err := os.Symlink(external, filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("create absolute-outside-source symlink: %v", err)
+	}
+
+	_, code, err := e.Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+	got, err := os.Readlink(filepath.Join(fx.wt, ".env"))
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if got != external {
+		t.Fatalf("expected verbatim external target %q, got %q", external, got)
+	}
+}
+
+func TestEngineApplyRecreatesSymlinkDryRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	if err := os.Remove(filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("remove source .env: %v", err)
+	}
+	if err := os.Symlink(".env.local", filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("create source symlink: %v", err)
+	}
+
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+		DryRun:  true,
+	})
+	if err != nil {
+		t.Fatalf("Apply dry-run: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply dry-run exit code = %d", code)
+	}
+	if res.Summary.SymlinkPlanned != 1 || res.Summary.Symlinked != 0 {
+		t.Fatalf("expected SymlinkPlanned=1 and Symlinked=0, got %+v", res.Summary)
 	}
 	if _, err := os.Lstat(filepath.Join(fx.wt, ".env")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("symlink source should not be copied into target, stat err=%v", err)
+		t.Fatalf("dry-run should not create .env, err=%v", err)
+	}
+	if action := findAction(t, res.Actions, ".env"); action.Op != "symlink" || action.Status != "planned" {
+		t.Fatalf("expected symlink/planned for .env, got %+v", action)
+	}
+}
+
+func TestEngineApplyRecreatesSymlinkSameSkip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	if err := os.Remove(filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("remove source .env: %v", err)
+	}
+	if err := os.Symlink(".env.local", filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("create source symlink: %v", err)
+	}
+	if err := os.Symlink(".env.local", filepath.Join(fx.wt, ".env")); err != nil {
+		t.Fatalf("create matching dst symlink: %v", err)
+	}
+
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d", code)
+	}
+	if res.Summary.SkippedSame != 1 {
+		t.Fatalf("expected SkippedSame=1, got %+v", res.Summary)
+	}
+	if action := findAction(t, res.Actions, ".env"); action.Op != "skip" || action.Status != "same_link" {
+		t.Fatalf("expected skip/same_link for .env, got %+v", action)
+	}
+}
+
+func TestEngineApplyRecreatesSymlinkConflictAndForce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior and permissions vary on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	if err := os.Remove(filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("remove source .env: %v", err)
+	}
+	if err := os.Symlink(".env.local", filepath.Join(fx.root, ".env")); err != nil {
+		t.Fatalf("create source symlink: %v", err)
+	}
+	writeFile(t, filepath.Join(fx.wt, ".env"), "PRE_EXISTING\n")
+
+	_, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.Conflict {
+		t.Fatalf("expected conflict exit code, got %d", code)
+	}
+
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+		Force:   true,
+	})
+	if err != nil {
+		t.Fatalf("Apply --force: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply --force exit code = %d", code)
+	}
+	if res.Summary.Symlinked != 1 {
+		t.Fatalf("expected force to replace with symlink, got %+v", res.Summary)
+	}
+	info, err := os.Lstat(filepath.Join(fx.wt, ".env"))
+	if err != nil {
+		t.Fatalf("lstat after force: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf(".env should be a symlink after --force, got mode=%v", info.Mode())
+	}
+	got, err := os.Readlink(filepath.Join(fx.wt, ".env"))
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if got != ".env.local" {
+		t.Fatalf("expected verbatim relative target, got %q", got)
 	}
 }
 
