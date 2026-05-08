@@ -4,13 +4,6 @@
 
 ## Quickstart
 
-### Install (Homebrew)
-
-```sh
-brew tap satococoa/tap
-brew install satococoa/tap/git-worktreeinclude
-```
-
 ### Build
 
 ```sh
