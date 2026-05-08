@@ -148,7 +148,7 @@ Uses the current worktree as target and copies from source worktree.
 git-worktreeinclude apply [--from auto|<path>] [--include <path>] [--dry-run] [--force] [--json] [--quiet] [--verbose]
 ```
 
-- `--from`: `auto` (default) chooses the first non-bare worktree from `git worktree list --porcelain -z` other than the current (target) worktree (typically the main worktree). Errors out when the only non-bare worktree is the target itself; pass `--from <path>` explicitly in that case.
+- `--from`: `auto` (default) chooses the first non-bare worktree from `git worktree list --porcelain -z` other than the current (target) worktree (typically the main worktree). When the target is the only non-bare worktree, `apply` is a no-op success (exit code `0`); pass `--from <path>` explicitly to force a specific source.
 - `--include`: include file path (default: `.worktreeinclude`)
   - relative path: resolved from source worktree root only
   - absolute path: must be inside source worktree root
@@ -166,6 +166,7 @@ Safe defaults:
 - Never deletes files
 - Never overwrites by default (differences become conflicts, exit code `3`)
 - Missing source `.worktreeinclude` is a no-op success (exit code `0`)
+- Single-worktree clone with `--from auto` is a no-op success (exit code `0`)
 
 ## JSON output
 
@@ -258,7 +259,7 @@ git -C <path> worktreeinclude apply --json
 - `not inside a git repository`: run from a Git repository
 - `source and target are not from the same repository`: verify `--from` points to the same repo worktree
 - `source and target are the same worktree`: `--from` resolved to the current worktree; pass `--from <path>` to a different worktree
-- `no other non-bare worktree found for --from auto`: only one non-bare worktree exists; create another worktree or pass `--from <path>`
+- single-worktree clone: `--from auto` is a no-op success; create another worktree or pass `--from <path>` if you want an actual copy
 - conflict exit: use `--force` or resolve target differences first
 - no-op due to missing include: verify `.worktreeinclude` exists in the source worktree selected by `--from`
 - if include exists only in target: copy that file to source worktree (or run with a different `--from`)

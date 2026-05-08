@@ -154,6 +154,9 @@ func (a *App) runApply(ctx context.Context, cmd *ucli.Command) error {
 					writeln(a.stdout, "Hint: include file was not found in source worktree and exists only in target worktree.")
 				}
 			}
+			if !result.IncludeFound && result.IncludeMissingHint == engine.IncludeMissingHintSingleWorktree {
+				writeln(a.stdout, "Hint: only one worktree exists; --from auto has no source worktree to copy from (no-op).")
+			}
 		}
 		for _, action := range result.Actions {
 			writeln(a.stdout, formatActionLine(action, force))
@@ -289,6 +292,10 @@ func formatIncludeStatusLine(path string, found bool, origin, hint, targetPath s
 			return fmt.Sprintf("INCLUDE file: %s (not found in source; found at target path %s; no-op)", path, targetPath)
 		}
 		return fmt.Sprintf("INCLUDE file: %s (not found in source; target has include file; no-op)", path)
+	}
+
+	if hint == engine.IncludeMissingHintSingleWorktree {
+		return "INCLUDE file: (skipped; single-worktree clone has no source; no-op)"
 	}
 
 	return fmt.Sprintf("INCLUDE file: %s (not found in source; no-op)", path)

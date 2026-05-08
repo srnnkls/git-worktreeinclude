@@ -937,7 +937,11 @@ func TestEngineApplyCopyModeConflictsWithExistingSymlink(t *testing.T) {
 	}
 }
 
-func TestEngineApplyAutoRefusesTargetWorktree(t *testing.T) {
+// TestEngineApplyAutoIsNoopInSingleWorktreeRepo pins the no-op short-circuit
+// for `--from auto` in a clone whose only non-bare worktree is the target.
+// See TestSingleWorktree_* in engine_singleworktree_test.go for the full
+// behavior contract.
+func TestEngineApplyAutoIsNoopInSingleWorktreeRepo(t *testing.T) {
 	base := t.TempDir()
 	repo := filepath.Join(base, "repo")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
@@ -953,15 +957,18 @@ func TestEngineApplyAutoRefusesTargetWorktree(t *testing.T) {
 	runGit(t, repo, "commit", "-q", "-m", "init")
 	writeFile(t, filepath.Join(repo, ".env"), "X\n")
 
-	_, code, err := NewEngine().Apply(context.Background(), repo, ApplyOptions{
+	res, code, err := NewEngine().Apply(context.Background(), repo, ApplyOptions{
 		From:    "auto",
 		Include: testIncludeFile,
 	})
-	if err == nil {
-		t.Fatalf("expected error when --from auto has only target worktree, got none (code=%d)", code)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
-	if code != exitcode.Env {
-		t.Fatalf("exit code = %d, want %d", code, exitcode.Env)
+	if code != exitcode.OK {
+		t.Fatalf("exit code = %d, want %d", code, exitcode.OK)
+	}
+	if res.IncludeMissingHint != IncludeMissingHintSingleWorktree {
+		t.Fatalf("IncludeMissingHint = %q, want %q", res.IncludeMissingHint, IncludeMissingHintSingleWorktree)
 	}
 }
 

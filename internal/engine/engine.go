@@ -123,6 +123,11 @@ const (
 
 	IncludeMissingHintSourceMissing             = "source_missing"
 	IncludeMissingHintSourceMissingTargetExists = "source_missing_target_exists"
+	// IncludeMissingHintSingleWorktree marks the no-op short-circuit taken
+	// when `--from auto` runs in a clone with only one non-bare worktree.
+	// Surfaced so post-checkout hooks can call `apply` unconditionally and
+	// downstream tooling can distinguish this from a true include miss.
+	IncludeMissingHintSingleWorktree = "single_worktree"
 )
 
 func (e *Engine) Apply(ctx context.Context, cwd string, opts ApplyOptions) (Result, int, error) {
@@ -496,9 +501,21 @@ func (e *Engine) prepare(ctx context.Context, cwd, fromOpt, includeOpt string) (
 		fromMode = "auto"
 	}
 
-	sourceRoot, err := e.resolveSourceRoot(ctx, targetRoot, cwd, fromMode)
+	sourceRoot, sourceFound, err := e.resolveSourceRoot(ctx, targetRoot, cwd, fromMode)
 	if err != nil {
 		return prepared{}, err
+	}
+
+	// `--from auto` in a clone with only one non-bare worktree has no source
+	// to copy from. Short-circuit to a no-op success so post-checkout hooks
+	// can run `apply` unconditionally without a worktree-count guard.
+	if !sourceFound {
+		return prepared{
+			targetRoot:         targetRoot,
+			fromMode:           fromMode,
+			includeArg:         includeArg,
+			includeMissingHint: IncludeMissingHintSingleWorktree,
+		}, nil
 	}
 
 	if err := e.assertSameRepository(ctx, targetRoot, sourceRoot); err != nil {
@@ -809,15 +826,19 @@ func (e *Engine) repoRoot(ctx context.Context, cwd string) (string, error) {
 	return root, nil
 }
 
-func (e *Engine) resolveSourceRoot(ctx context.Context, targetRoot, cwd, from string) (string, error) {
+// resolveSourceRoot returns the source worktree root, a "found" flag, and
+// any hard error. The flag is false (with a nil error) only for `--from auto`
+// in a clone with no other non-bare worktree — that case is a no-op success
+// at the caller, not an environment error.
+func (e *Engine) resolveSourceRoot(ctx context.Context, targetRoot, cwd, from string) (string, bool, error) {
 	if from == "auto" {
 		out, err := e.git.Run(ctx, targetRoot, "worktree", "list", "--porcelain", "-z")
 		if err != nil {
-			return "", &CLIError{Code: exitcode.Env, Msg: "failed to list worktrees", Err: err}
+			return "", false, &CLIError{Code: exitcode.Env, Msg: "failed to list worktrees", Err: err}
 		}
 		worktrees, err := parseWorktreePorcelainZ(out)
 		if err != nil {
-			return "", &CLIError{Code: exitcode.Env, Msg: "failed to parse worktree list", Err: err}
+			return "", false, &CLIError{Code: exitcode.Env, Msg: "failed to parse worktree list", Err: err}
 		}
 		targetCanon := canonicalPath(targetRoot)
 		for _, wt := range worktrees {
@@ -828,9 +849,9 @@ func (e *Engine) resolveSourceRoot(ctx context.Context, targetRoot, cwd, from st
 			if canonicalPath(candidate) == targetCanon {
 				continue
 			}
-			return candidate, nil
+			return candidate, true, nil
 		}
-		return "", &CLIError{Code: exitcode.Env, Msg: "no other non-bare worktree found for --from auto; pass --from <path> to specify the source", Err: nil}
+		return "", false, nil
 	}
 
 	sourcePath := from
@@ -841,9 +862,9 @@ func (e *Engine) resolveSourceRoot(ctx context.Context, targetRoot, cwd, from st
 
 	sourceRoot, err := e.repoRoot(ctx, sourcePath)
 	if err != nil {
-		return "", &CLIError{Code: exitcode.Env, Msg: "invalid --from path", Err: err}
+		return "", false, &CLIError{Code: exitcode.Env, Msg: "invalid --from path", Err: err}
 	}
-	return sourceRoot, nil
+	return sourceRoot, true, nil
 }
 
 func (e *Engine) assertSameRepository(ctx context.Context, targetRoot, sourceRoot string) error {
