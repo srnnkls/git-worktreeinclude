@@ -17,9 +17,10 @@ import (
 )
 
 type Action struct {
-	Op     string `json:"op"`
-	Path   string `json:"path"`
-	Status string `json:"status"`
+	Op       string `json:"op"`
+	Path     string `json:"path"`
+	Status   string `json:"status"`
+	Expanded int    `json:"expanded,omitempty"`
 }
 
 type Summary struct {
@@ -59,8 +60,15 @@ type ApplyOptions struct {
 	Force   bool
 }
 
+// gitRunner is the minimal interface the engine needs from a git executor.
+// Tests substitute counting wrappers; production uses *gitexec.Runner.
+type gitRunner interface {
+	Run(ctx context.Context, cwd string, args ...string) ([]byte, error)
+	RunText(ctx context.Context, cwd string, args ...string) (string, error)
+}
+
 type Engine struct {
-	git *gitexec.Runner
+	git gitRunner
 }
 
 type CLIError struct {
@@ -106,6 +114,7 @@ type prepared struct {
 	patternCount       int
 	candidates         []candidate
 	submodulePaths     map[string]struct{}
+	tracked            *trackedSetCache
 }
 
 // candidate is one resolved entry produced by `prepare`. Each candidate maps
@@ -183,11 +192,11 @@ func (e *Engine) executePrepared(ctx context.Context, prep prepared, dryRun, for
 	return result, exitcode.OK
 }
 
-// executeCandidate processes a single resolved candidate, applying the
-// per-action tracked-check before any copy/symlink work. Returns the number
-// of "matched" units (a dir-copy expanded into N files contributes N) and
-// the number of tracked-status conflicts emitted (which `--force` cannot
-// override).
+// executeCandidate processes a single resolved candidate, dispatching to the
+// unified walker for directories and submodules and to leaf application
+// otherwise. Returns the number of leaf actions matched (each per-leaf
+// action contributes one) and the number of tracked-status conflicts emitted
+// (which `--force` cannot override).
 func (e *Engine) executeCandidate(ctx context.Context, result *Result, prep prepared, c candidate, dryRun, force bool) (int, int) {
 	srcPath, err := secureJoin(prep.sourceRoot, c.rel)
 	if err != nil {
@@ -220,132 +229,162 @@ func (e *Engine) executeCandidate(ctx context.Context, result *Result, prep prep
 		return 1, 0
 	}
 
-	_, isSubmodule := prep.submodulePaths[c.rel]
+	leavesBefore := len(result.Actions)
 
-	// Submodule with default-copy mode is unsupported; emit a clear skip and
-	// move on without touching the destination.
-	if isSubmodule && c.mode == ModeCopy {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusSubmoduleCopyUnsupported})
-		result.Summary.SkippedSubmoduleCopy++
-		return 1, 0
+	matched, recursed := e.walk(ctx, result, prep, c, c.rel, srcPath, dstPath, srcInfo, dryRun, force)
+
+	// `expand/walked` rolls up the per-leaf actions emitted under this
+	// candidate so JSON consumers can correlate leaves back to their
+	// originating pattern. `Expanded` counts every leaf entry, including
+	// `same_link`, `done`, `conflict`, `skip`. The rollup itself does not
+	// increment Summary.Matched.
+	if recursed {
+		expanded := len(result.Actions) - leavesBefore
+		result.Actions = append(result.Actions, Action{
+			Op:       "expand",
+			Path:     c.rel,
+			Status:   StatusWalked,
+			Expanded: expanded,
+		})
 	}
 
-	// Per-action tracked-check. Submodule gitlinks legitimately appear in the
-	// index of both worktrees, so a known submodule path bypasses the check.
-	// Everything else must be untracked on both sides; `--force` does NOT
-	// override.
-	if !isSubmodule {
-		if e.isPathTracked(ctx, prep.sourceRoot, c.rel) || e.isSubtreeTracked(ctx, prep.sourceRoot, c.rel) {
-			result.Actions = append(result.Actions, Action{Op: "conflict", Path: c.rel, Status: StatusTracked})
-			result.Summary.Conflicts++
-			return 1, 1
-		}
-		if e.isPathTracked(ctx, prep.targetRoot, c.rel) || e.isSubtreeTracked(ctx, prep.targetRoot, c.rel) {
-			result.Actions = append(result.Actions, Action{Op: "conflict", Path: c.rel, Status: StatusTracked})
-			result.Summary.Conflicts++
-			return 1, 1
+	// Count tracked-status conflicts emitted under this candidate so the
+	// caller can refuse `--force` overrides for them.
+	trackedDelta := 0
+	for i := leavesBefore; i < len(result.Actions); i++ {
+		a := result.Actions[i]
+		if a.Op == "conflict" && a.Status == StatusTracked {
+			trackedDelta++
 		}
 	}
+	return matched, trackedDelta
+}
 
-	// Source-side symlink: recreate a symlink at destination regardless of
-	// the pattern's attribute (matches existing source-symlink semantics).
+// walk implements the per-leaf descent contract documented in
+// graceful-humming-anchor.md. It returns (leafCount, recursed). `recursed`
+// is true when at least one child was visited (i.e., the caller should emit
+// a rollup). Leaf actions are appended directly to result.Actions; the
+// rollup itself is emitted by the caller, not by walk.
+func (e *Engine) walk(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, srcInfo os.FileInfo, dryRun, force bool) (int, bool) {
+	_, isSubmodule := prep.submodulePaths[rel]
+
+	// 1. Submodule path: applies at every depth.
+	if isSubmodule {
+		if c.mode == ModeCopy {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusSubmoduleCopyUnsupported})
+			result.Summary.SkippedSubmoduleCopy++
+			return 1, false
+		}
+		applySymlink(result, prep.targetRoot, rel, srcAbs, dstAbs, dryRun, force)
+		return 1, false
+	}
+
+	// 2. Source symlink: recreate at destination regardless of pattern mode.
 	if srcInfo.Mode()&os.ModeSymlink != 0 {
-		linkTarget, err := os.Readlink(srcPath)
+		linkTarget, err := os.Readlink(srcAbs)
 		if err != nil {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusError})
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
 			result.Summary.Errors++
-			return 1, 0
+			return 1, false
 		}
 		linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
-		applySymlink(result, prep.targetRoot, c.rel, linkTarget, dstPath, dryRun, force)
-		return 1, 0
+		applySymlink(result, prep.targetRoot, rel, linkTarget, dstAbs, dryRun, force)
+		return 1, false
 	}
 
-	// Submodule (gitlink) or directory with `symlink` attribute: emit ONE
-	// directory-level symlink, no recursion.
-	if (isSubmodule || srcInfo.IsDir()) && c.mode == ModeSymlink {
-		applySymlink(result, prep.targetRoot, c.rel, srcPath, dstPath, dryRun, force)
-		return 1, 0
-	}
-
+	// 3. Directory.
 	if srcInfo.IsDir() {
-		// copy-mode directory: walk the source dir and emit per-file copy
-		// candidates. Negations within the dir are not supported in literal
-		// mode — users wanting fine-grained exclusion should reach for globs.
-		return e.expandDirCopy(ctx, result, prep, c.rel, srcPath, dryRun, force), 0
+		return e.walkDir(ctx, result, prep, c, rel, srcAbs, dstAbs, dryRun, force)
+	}
+
+	// 4-7. Leaf file (regular or other).
+	return e.walkLeafFile(ctx, result, prep, c, rel, srcAbs, dstAbs, srcInfo, dryRun, force)
+}
+
+// walkDir handles the directory branch of the walker. In symlink mode an
+// untracked-on-both-sides subtree anchors as a single directory symlink; any
+// tracked content on either side forces recursion. In copy mode the walker
+// always recurses (no dir-anchor shortcut). Returns (leafCount, recursed).
+func (e *Engine) walkDir(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, dryRun, force bool) (int, bool) {
+	if c.mode == ModeSymlink {
+		// Anchor at the deepest fully-untracked subtree.
+		srcTracked := e.isSubtreeTracked(ctx, prep.tracked, prep.sourceRoot, rel)
+		dstTracked := e.isPathTracked(ctx, prep.tracked, prep.targetRoot, rel) || e.isSubtreeTracked(ctx, prep.tracked, prep.targetRoot, rel)
+		if !srcTracked && !dstTracked {
+			applySymlink(result, prep.targetRoot, rel, srcAbs, dstAbs, dryRun, force)
+			return 1, false
+		}
+	}
+
+	entries, err := os.ReadDir(srcAbs)
+	if err != nil {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
+		result.Summary.Errors++
+		return 1, false
+	}
+
+	matched := 0
+	for _, entry := range entries {
+		childRel := rel + "/" + entry.Name()
+		// Strip an accidental leading slash for repo-relative-rooted patterns.
+		childRel = strings.TrimPrefix(childRel, "/")
+
+		childSrc, err := secureJoin(prep.sourceRoot, childRel)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			continue
+		}
+		childDst, err := secureJoin(prep.targetRoot, childRel)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			continue
+		}
+		childInfo, err := os.Lstat(childSrc)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			continue
+		}
+
+		childMatched, _ := e.walk(ctx, result, prep, c, childRel, childSrc, childDst, childInfo, dryRun, force)
+		matched += childMatched
+	}
+	return matched, true
+}
+
+// walkLeafFile handles a non-directory, non-submodule, non-source-symlink
+// leaf reached during the walk (or the pattern root if it points directly at
+// a regular file). Tracked source leaves are silently skipped per the plan;
+// tracked target leaves are a hard `conflict/tracked` (--force does NOT
+// override).
+func (e *Engine) walkLeafFile(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, srcInfo os.FileInfo, dryRun, force bool) (int, bool) {
+	if e.isPathTracked(ctx, prep.tracked, prep.sourceRoot, rel) {
+		return 0, false
 	}
 
 	if !srcInfo.Mode().IsRegular() {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusMissingSrc})
-		result.Summary.SkippedMissingSrc++
-		return 1, 0
+		// Devices, sockets, fifos: silently ignored to mirror existing walk
+		// behavior. No action, no summary increment.
+		return 0, false
+	}
+
+	if e.isPathTracked(ctx, prep.tracked, prep.targetRoot, rel) {
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusTracked})
+		result.Summary.Conflicts++
+		return 1, false
 	}
 
 	if c.mode == ModeSymlink {
-		applySymlink(result, prep.targetRoot, c.rel, srcPath, dstPath, dryRun, force)
+		applySymlink(result, prep.targetRoot, rel, srcAbs, dstAbs, dryRun, force)
 	} else {
-		applyCopy(result, prep.targetRoot, c.rel, srcPath, dstPath, srcInfo.Mode().Perm(), dryRun, force)
+		applyCopy(result, prep.targetRoot, rel, srcAbs, dstAbs, srcInfo.Mode().Perm(), dryRun, force)
 	}
-	return 1, 0
-}
-
-// expandDirCopy walks `srcDir` (a dir candidate in copy mode) and emits a
-// per-file copy action for each regular file it contains. Tracked files
-// inside the dir are skipped silently — the parent candidate already failed
-// the subtree-tracked check earlier, so reaching this point implies nothing
-// below is tracked, but we re-verify per file to be defensive.
-func (e *Engine) expandDirCopy(ctx context.Context, result *Result, prep prepared, rel, srcDir string, dryRun, force bool) int {
-	matched := 0
-	walkErr := filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		relFile, relErr := filepath.Rel(prep.sourceRoot, p)
-		if relErr != nil {
-			return relErr
-		}
-		relFile = filepath.ToSlash(relFile)
-		if e.isPathTracked(ctx, prep.sourceRoot, relFile) {
-			return nil
-		}
-		dstPath, err := secureJoin(prep.targetRoot, relFile)
-		if err != nil {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: relFile, Status: StatusError})
-			result.Summary.Errors++
-			matched++
-			return nil
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			linkTarget, lerr := os.Readlink(p)
-			if lerr != nil {
-				result.Actions = append(result.Actions, Action{Op: "skip", Path: relFile, Status: StatusError})
-				result.Summary.Errors++
-				matched++
-				return nil
-			}
-			linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
-			applySymlink(result, prep.targetRoot, relFile, linkTarget, dstPath, dryRun, force)
-			matched++
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		applyCopy(result, prep.targetRoot, relFile, p, dstPath, info.Mode().Perm(), dryRun, force)
-		matched++
-		return nil
-	})
-	if walkErr != nil {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
-		result.Summary.Errors++
-		if matched == 0 {
-			matched = 1
-		}
-	}
-	return matched
+	return 1, false
 }
 
 func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os.FileMode, dryRun, force bool) {
@@ -579,6 +618,7 @@ func (e *Engine) prepare(ctx context.Context, cwd, fromOpt, includeOpt string) (
 		return prepared{}, err
 	}
 	prep.candidates = candidates
+	prep.tracked = newTrackedSetCache(e.git)
 	return prep, nil
 }
 
@@ -792,23 +832,15 @@ func (e *Engine) discoverSubmodules(ctx context.Context, repoRoot string) (map[s
 	return paths, nil
 }
 
-// isPathTracked reports whether `rel` is itself tracked in the index.
-func (e *Engine) isPathTracked(ctx context.Context, repoRoot, rel string) bool {
-	_, err := e.git.Run(ctx, repoRoot, "ls-files", "--error-unmatch", "-z", "--", rel)
-	return err == nil
+// isPathTracked is a thin wrapper around the bulk-loaded tracked-set so the
+// engine can ask "is `rel` itself tracked at this repoRoot?" in O(1).
+func (e *Engine) isPathTracked(ctx context.Context, cache *trackedSetCache, repoRoot, rel string) bool {
+	return cache.get(ctx, repoRoot).hasPath(rel)
 }
 
 // isSubtreeTracked reports whether any tracked path lives at-or-below `rel`.
-func (e *Engine) isSubtreeTracked(ctx context.Context, repoRoot, rel string) bool {
-	out, err := e.git.Run(ctx, repoRoot, "ls-files", "-z", "--", rel)
-	if err == nil && len(bytes.TrimRight(out, "\x00")) > 0 {
-		return true
-	}
-	out, err = e.git.Run(ctx, repoRoot, "ls-files", "-z", "--", rel+"/")
-	if err == nil && len(bytes.TrimRight(out, "\x00")) > 0 {
-		return true
-	}
-	return false
+func (e *Engine) isSubtreeTracked(ctx context.Context, cache *trackedSetCache, repoRoot, rel string) bool {
+	return cache.get(ctx, repoRoot).hasPathOrSubtree(rel)
 }
 
 // isLiteralPattern returns true when `glob` contains no glob metacharacters,

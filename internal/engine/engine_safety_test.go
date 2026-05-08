@@ -161,14 +161,12 @@ func TestSafety_UntrackedNotIgnoredFileIsActioned(t *testing.T) {
 	}
 }
 
-// TestSafety_TrackedSourceFileRefused — listing a tracked source file in the
-// include must produce a conflict with status="tracked". `--force` must NOT
-// override (tracked content is always off-limits).
-func TestSafety_TrackedSourceFileRefused(t *testing.T) {
+// TestSafety_TrackedSourceFileSilentlySkipped — a tracked source leaf is
+// silently skipped at every depth, including when it is the candidate root.
+// No action, no conflict, no error. Target-tracked leaves remain a hard
+// `conflict/tracked` (covered by walker tests); source-tracked is skip-silent.
+func TestSafety_TrackedSourceFileSilentlySkipped(t *testing.T) {
 	fx := setupEngineFixture(t)
-	// README.md is tracked in setupEngineFixture and is already listed in
-	// the default testIncludeFile. We replace the include with a single
-	// pattern to make assertions surgical.
 	writeFile(t, filepath.Join(fx.root, testIncludeFile), "README.md\n")
 
 	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
@@ -178,42 +176,28 @@ func TestSafety_TrackedSourceFileRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if code != exitcode.Conflict {
-		t.Fatalf("Apply exit code = %d, want %d (tracked source must conflict)", code, exitcode.Conflict)
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d (tracked source must silently skip)", code, exitcode.OK)
 	}
-	if action := findAction(t, res.Actions, "README.md"); action.Op != "conflict" || action.Status != StatusTracked {
-		t.Fatalf("expected conflict/%s for README.md, got %+v", StatusTracked, action)
+	if a := findActionOptional(res.Actions, "README.md"); a.Op != "" {
+		t.Fatalf("tracked source leaf must produce no action, got %+v", a)
 	}
-
-	// --force must NOT override a tracked refusal.
-	res, code, err = NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
-		From:    "auto",
-		Include: testIncludeFile,
-		Force:   true,
-	})
-	if err != nil {
-		t.Fatalf("Apply --force: %v", err)
-	}
-	if code != exitcode.Conflict {
-		t.Fatalf("Apply --force exit code = %d, want %d (--force must NOT override tracked)", code, exitcode.Conflict)
-	}
-	if action := findAction(t, res.Actions, "README.md"); action.Op != "conflict" || action.Status != StatusTracked {
-		t.Fatalf("expected conflict/%s for README.md under --force, got %+v", StatusTracked, action)
+	if res.Summary.Conflicts != 0 || res.Summary.Errors != 0 {
+		t.Fatalf("tracked source leaf must not increment conflicts/errors, got %+v", res.Summary)
 	}
 }
 
-// TestSafety_TrackedDestinationSubtreeRefusedForDirSymlink — when a directory
-// symlink would land on a target subtree containing tracked files, refuse.
-func TestSafety_TrackedDestinationSubtreeRefusedForDirSymlink(t *testing.T) {
+// TestSafety_TrackedDestinationSubtreeWalksAroundTrackedLeaves — the walker
+// recurses into a partial-tracked dir, anchors a symlink at every untracked
+// leaf, and silently leaves tracked-target leaves alone (no per-leaf action,
+// exit OK).
+func TestSafety_TrackedDestinationSubtreeWalksAroundTrackedLeaves(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior varies on Windows")
 	}
 
 	fx := setupEngineFixture(t)
-	// Add a tracked file under target subtree mixed/keep.txt by committing
-	// to source main and pulling it into the existing worktree. The
-	// existing fixture has `feature` checked out in fx.wt; we add the file
-	// on `feature` directly so the index of fx.wt holds it.
+	// Tracked target leaf: mixed/keep.txt committed on the worktree branch.
 	if err := os.MkdirAll(filepath.Join(fx.wt, "mixed"), 0o755); err != nil {
 		t.Fatalf("mkdir target mixed/: %v", err)
 	}
@@ -221,9 +205,7 @@ func TestSafety_TrackedDestinationSubtreeRefusedForDirSymlink(t *testing.T) {
 	runGit(t, fx.wt, "add", "mixed/keep.txt")
 	runGit(t, fx.wt, "commit", "-q", "-m", "tracked mixed/keep.txt in target")
 
-	// Source has untracked content under mixed/ that the user wants to
-	// dir-symlink; `.gitignore` includes mixed/ so the source content is
-	// untracked.
+	// Source has only an untracked file under mixed/ (.gitignore covers it).
 	writeFile(t, filepath.Join(fx.root, ".gitignore"), ".env\n.env.local\nmixed/\n")
 	runGit(t, fx.root, "add", ".gitignore")
 	runGit(t, fx.root, "commit", "-q", "-m", "ignore mixed/")
@@ -241,27 +223,51 @@ func TestSafety_TrackedDestinationSubtreeRefusedForDirSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if code != exitcode.Conflict {
-		t.Fatalf("Apply exit code = %d, want %d (tracked dest subtree must conflict)", code, exitcode.Conflict)
-	}
-	if action := findAction(t, res.Actions, "mixed"); action.Op != "conflict" || action.Status != StatusTracked {
-		// The candidate path may be reported as "mixed" or "mixed/" — both
-		// are acceptable; we look for the directory-level entry.
-		if alt := findActionOptional(res.Actions, "mixed/"); alt.Op == "" {
-			t.Fatalf("expected conflict/%s for mixed (or mixed/), got %+v (all=%+v)", StatusTracked, action, res.Actions)
-		} else if alt.Op != "conflict" || alt.Status != StatusTracked {
-			t.Fatalf("expected conflict/%s, got %+v", StatusTracked, alt)
-		}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d (walker should anchor around tracked leaf)", code, exitcode.OK)
 	}
 
-	// No symlink should have been created at the destination.
-	dst := filepath.Join(fx.wt, "mixed")
-	info, err := os.Lstat(dst)
+	// Rollup at pattern root.
+	rollup := findActionOptional(res.Actions, "mixed")
+	if rollup.Op != "expand" || rollup.Status != StatusWalked {
+		t.Fatalf("expected expand/%s rollup at mixed, got %+v (all=%+v)", StatusWalked, rollup, res.Actions)
+	}
+	if rollup.Expanded < 1 {
+		t.Fatalf("expand rollup should report expanded>=1, got %+v", rollup)
+	}
+
+	// Untracked leaf gets a symlink.
+	if action := findAction(t, res.Actions, "mixed/build.log"); action.Op != "symlink" || action.Status != "done" {
+		t.Fatalf("expected symlink/done for mixed/build.log, got %+v", action)
+	}
+	leaf := filepath.Join(fx.wt, "mixed", "build.log")
+	info, err := os.Lstat(leaf)
+	if err != nil {
+		t.Fatalf("lstat mixed/build.log: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("mixed/build.log should be a symlink, got mode=%v", info.Mode())
+	}
+
+	// Tracked target leaf untouched and not actioned.
+	if a := findActionOptional(res.Actions, "mixed/keep.txt"); a.Op != "" {
+		t.Fatalf("tracked target leaf must produce no action, got %+v", a)
+	}
+	keep, err := os.ReadFile(filepath.Join(fx.wt, "mixed", "keep.txt"))
+	if err != nil {
+		t.Fatalf("read mixed/keep.txt: %v", err)
+	}
+	if string(keep) != "TARGET_KEEP\n" {
+		t.Fatalf("tracked target leaf should remain unchanged, got %q", keep)
+	}
+
+	// `mixed` itself must remain a directory (not anchored as a symlink).
+	dirInfo, err := os.Lstat(filepath.Join(fx.wt, "mixed"))
 	if err != nil {
 		t.Fatalf("lstat target mixed/: %v", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("target mixed/ must NOT be replaced with a symlink, mode=%v", info.Mode())
+	if dirInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("target mixed/ must NOT be replaced with a symlink, mode=%v", dirInfo.Mode())
 	}
 }
 
@@ -310,6 +316,10 @@ func TestSafety_DirSymlinkForIgnoredDir(t *testing.T) {
 			t.Fatalf("expected no per-file action for %s, got %+v", sub, a)
 		}
 	}
+	// No rollup either: nothing recursed, the dir was anchored at the pattern root.
+	if a := findActionOptional(res.Actions, "cache"); a.Op == "expand" {
+		t.Fatalf("anchored dir-symlink must NOT emit an expand rollup, got %+v", a)
+	}
 }
 
 // TestSafety_DirCopyRecursesFiles — a gitignored dir with default copy
@@ -344,6 +354,15 @@ func TestSafety_DirCopyRecursesFiles(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(fx.wt, rel)); err != nil {
 			t.Fatalf("expected file %s in target: %v", rel, err)
 		}
+	}
+
+	// Copy-mode dir always walks, so a rollup must be emitted at the pattern root.
+	rollup := findActionOptional(res.Actions, "cache")
+	if rollup.Op != "expand" || rollup.Status != StatusWalked {
+		t.Fatalf("expected expand/%s rollup at cache, got %+v (all=%+v)", StatusWalked, rollup, res.Actions)
+	}
+	if rollup.Expanded < 2 {
+		t.Fatalf("expand rollup should count both leaves, got %+v", rollup)
 	}
 
 	// The destination must NOT be a single symlink.
@@ -400,10 +419,10 @@ func TestSafety_GlobPatternStillExpands(t *testing.T) {
 	}
 }
 
-// TestSafety_PartiallyTrackedDirSymlinkRefused — a directory containing both
-// a tracked file and an untracked file, listed with `symlink`, must be
-// refused (subtree-tracked check fires).
-func TestSafety_PartiallyTrackedDirSymlinkRefused(t *testing.T) {
+// TestSafety_PartiallyTrackedDirSymlinkWalksAndAnchorsLeaves — a partial dir
+// listed with `symlink` walks: a rollup at the pattern root, a symlink at
+// the untracked leaf, and silent skip for the tracked source leaf.
+func TestSafety_PartiallyTrackedDirSymlinkWalksAndAnchorsLeaves(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior varies on Windows")
 	}
@@ -426,22 +445,40 @@ func TestSafety_PartiallyTrackedDirSymlinkRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if code != exitcode.Conflict {
-		t.Fatalf("Apply exit code = %d, want %d (partially-tracked source must conflict)", code, exitcode.Conflict)
-	}
-	action := findActionOptional(res.Actions, ".cfg")
-	if action.Op == "" {
-		action = findActionOptional(res.Actions, ".cfg/")
-	}
-	if action.Op != "conflict" || action.Status != StatusTracked {
-		t.Fatalf("expected conflict/%s for .cfg, got %+v (all=%+v)", StatusTracked, action, res.Actions)
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d (walker should anchor untracked leaves)", code, exitcode.OK)
 	}
 
-	// No symlink at destination.
-	if info, err := os.Lstat(filepath.Join(fx.wt, ".cfg")); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			t.Fatalf("partially-tracked .cfg must NOT be replaced with a symlink")
-		}
+	rollup := findActionOptional(res.Actions, ".cfg")
+	if rollup.Op != "expand" || rollup.Status != StatusWalked {
+		t.Fatalf("expected expand/%s rollup at .cfg, got %+v (all=%+v)", StatusWalked, rollup, res.Actions)
+	}
+	if rollup.Expanded < 1 {
+		t.Fatalf("expand rollup should report expanded>=1, got %+v", rollup)
+	}
+
+	if action := findAction(t, res.Actions, ".cfg/untracked.toml"); action.Op != "symlink" || action.Status != "done" {
+		t.Fatalf("expected symlink/done for .cfg/untracked.toml, got %+v", action)
+	}
+	if a := findActionOptional(res.Actions, ".cfg/tracked.toml"); a.Op != "" {
+		t.Fatalf("tracked source leaf must produce no action, got %+v", a)
+	}
+
+	leaf := filepath.Join(fx.wt, ".cfg", "untracked.toml")
+	info, err := os.Lstat(leaf)
+	if err != nil {
+		t.Fatalf("lstat .cfg/untracked.toml: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf(".cfg/untracked.toml should be a symlink, got mode=%v", info.Mode())
+	}
+
+	dirInfo, err := os.Lstat(filepath.Join(fx.wt, ".cfg"))
+	if err != nil {
+		t.Fatalf("lstat target .cfg: %v", err)
+	}
+	if dirInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("partial-tracked .cfg must NOT be replaced with a symlink")
 	}
 }
 

@@ -30,4 +30,8 @@ const (
 	// StatusSubmoduleCopyUnsupported is a skip raised when a `.gitmodules`
 	// gitlink would be copied; submodules can only be symlinked.
 	StatusSubmoduleCopyUnsupported = "submodule_copy_unsupported"
+	// StatusWalked is the per-pattern rollup status emitted by `op:expand`
+	// when a directory candidate triggered recursion. The rollup carries the
+	// per-leaf count in Action.Expanded.
+	StatusWalked = "walked"
 )

@@ -38,11 +38,13 @@ Each pattern is evaluated independently:
 - **Globs** expand against the source worktree using `git ls-files`, so untracked-but-not-gitignored files matching the glob are still picked up.
 - Negation lines (`!foo`) subtract from the matched set with the usual gitignore semantics.
 
-For each candidate, `git-worktreeinclude` performs a per-action **tracked-check** before any copy or symlink:
+For each candidate, `git-worktreeinclude` performs a per-leaf **tracked-check** as it walks the source subtree:
 
-- If the source path (or anything beneath it) is tracked in the source worktree's index, the action is refused with status `tracked`.
-- If the destination path (or anything beneath it) is tracked in the target worktree's index, the action is refused with status `tracked`.
-- `--force` does **not** override `tracked` conflicts. Refusing to clobber version-controlled content is non-negotiable.
+- A tracked source leaf is silently skipped — no action, no conflict, no error. Listing a directory whose subtree mixes tracked and untracked content (`.claude/` with committed shared rules plus untracked local agent files) is well-formed: tracked content stays untouched, untracked content is symlinked or copied.
+- A tracked target leaf is a hard `conflict` with status `tracked`. `--force` does **not** override; refusing to clobber version-controlled content at the target is non-negotiable.
+- For `symlink` patterns the walker anchors at the deepest fully-untracked subtree: `.claude/skills/loqui` becomes one directory symlink, `.claude/skills/effect` (tracked) is silently skipped. Where the subtree contains tracked content on either side, the walker descends and decides per-leaf.
+
+Negation lines (`!foo`) are evaluated at candidate-resolution time and do **not** propagate into a walked subtree. Use a more specific pattern (or `copy`/`symlink` distinction) when fine-grained exclusion inside a directory matters.
 
 Example for a typical app repo with local env, editor settings, and tool-specific cache:
 
@@ -101,9 +103,11 @@ Symlink mode notes:
 
 ### Directory-level symlinks
 
-When a `symlink`-attributed pattern resolves to a directory in the source worktree, `git-worktreeinclude` creates **one** symlink at the destination pointing at the source directory's absolute path; it does not recurse into the directory. Use this to share large untracked trees (caches, build outputs, vendored deps) across worktrees without duplicating bytes.
+When a `symlink`-attributed pattern resolves to a fully-untracked directory in the source worktree, `git-worktreeinclude` creates **one** symlink at the destination pointing at the source directory's absolute path. Use this to share large untracked trees (caches, build outputs, vendored deps) across worktrees without duplicating bytes.
 
-When the same pattern resolves to a directory under the default `copy` mode, the directory is walked and each contained file is copied individually.
+When the same pattern resolves to a **partial-tracked** directory — tracked content on either side, untracked content beside it — the walker descends and anchors at the deepest fully-untracked subtree it can reach. Tracked source leaves are silently skipped; tracked target leaves emit `conflict/tracked`. Submodule paths (gitlinks) and source-side symlinks are handled at every depth, not only at the pattern root.
+
+When the same pattern resolves to a directory under the default `copy` mode, the directory is always walked and each contained file is copied individually (no dir-anchor shortcut).
 
 ### Submodules
 
@@ -221,11 +225,22 @@ Dry-run mode (`apply --dry-run --json`):
 
 - `"dry_run": true` indicates no files were written
 - In dry-run mode `"copy_planned"` / `"symlink_planned"` are used instead of `"copied"` / `"symlinked"` in the summary (they are mutually exclusive)
-- `op` is one of `copy`, `symlink`, `skip`, `conflict`
+- `op` is one of `copy`, `symlink`, `skip`, `conflict`, `expand`
 - `status` for `skip` includes `same`, `same_link`, `missing_src`, `submodule_copy_unsupported` (increments `skipped_submodule_copy`), `error`
-- `status` for `conflict` is `diff` (copy mode), `diff_link` (symlink mode), or `tracked` (source or destination has tracked content; `--force` does not override)
+- `status` for `conflict` is `diff` (copy mode), `diff_link` (symlink mode), or `tracked` (target has tracked content; `--force` does not override)
+- `op:expand` with `status:walked` is a per-pattern rollup emitted only when a directory candidate triggered recursion. The action carries an `expanded` integer counting every per-leaf action emitted under that walk (including `same_link`, `done`, `conflict`, `skip`). The rollup itself does NOT increment `summary.matched` — `summary.symlinked`, `summary.copied`, and the rest count leaves only.
 - `path` is repo-root relative and slash-separated
 - File contents and secrets are never output
+
+A walked partial-tracked directory looks like this in `actions`:
+
+```json
+[
+  {"op": "symlink", "path": ".claude/agents", "status": "done"},
+  {"op": "symlink", "path": ".claude/skills/loqui", "status": "done"},
+  {"op": "expand", "path": ".claude", "status": "walked", "expanded": 2}
+]
+```
 
 ## External tool integration
 
