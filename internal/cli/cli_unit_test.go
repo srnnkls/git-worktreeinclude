@@ -254,7 +254,7 @@ func setupCLIRepoFixture(t *testing.T) cliRepoFixture {
 
 	writeTestFile(t, filepath.Join(repo, "README.md"), "tracked\n")
 	writeTestFile(t, filepath.Join(repo, ".gitignore"), ".env\n.env.local\n")
-	writeTestFile(t, filepath.Join(repo, testIncludeFile), ".env\n.env.local\nREADME.md\n")
+	writeTestFile(t, filepath.Join(repo, testIncludeFile), ".env\n.env.local\n")
 	runGit(t, repo, "add", "README.md", ".gitignore", testIncludeFile)
 	runGit(t, repo, "commit", "-q", "-m", "init")
 

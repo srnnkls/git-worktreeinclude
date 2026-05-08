@@ -38,11 +38,18 @@ git worktreeinclude apply
 - Place `.worktreeinclude` at the source worktree root (by default, this is typically the main worktree selected by `--from auto`).
 - Format is gitignore-compatible (`#` comments, blank lines, `!` negation, `/` anchors, `**`, etc.).
 - `.worktreeinclude` may be tracked, untracked, or ignored; if the file exists in the source worktree, it is used.
-- Actual sync target is the intersection of:
-  - Paths matching `.worktreeinclude`
-  - Paths Git classifies as ignored
 
-Tracked files are never copied, even if listed in `.worktreeinclude`.
+Each pattern is evaluated independently:
+
+- **Literal paths** (no `*`, `?`, `[`) act on the named source path directly. The path may be untracked, gitignored, or even untracked-but-not-gitignored — if it exists in the source worktree, it is a candidate.
+- **Globs** expand against the source worktree using `git ls-files`, so untracked-but-not-gitignored files matching the glob are still picked up.
+- Negation lines (`!foo`) subtract from the matched set with the usual gitignore semantics.
+
+For each candidate, `git-worktreeinclude` performs a per-action **tracked-check** before any copy or symlink:
+
+- If the source path (or anything beneath it) is tracked in the source worktree's index, the action is refused with status `tracked`.
+- If the destination path (or anything beneath it) is tracked in the target worktree's index, the action is refused with status `tracked`.
+- `--force` does **not** override `tracked` conflicts. Refusing to clobber version-controlled content is non-negotiable.
 
 Example for a typical app repo with local env, editor settings, and tool-specific cache:
 
@@ -98,6 +105,19 @@ Symlink mode notes:
 - A pattern resolved as `copy` will also conflict if the destination already exists as a symlink (matches symlink-mode strictness; `--force` replaces with a regular file).
 - Globs cannot contain whitespace (no quoting): the first whitespace run separates pattern from attributes.
 - "Any matching `symlink` pattern wins": if a path matches both a copy-mode pattern and a symlink-mode pattern, it is symlinked. Negation lines (`!foo`) are honored within the symlink set the same way they are in a regular gitignore file.
+
+### Directory-level symlinks
+
+When a `symlink`-attributed pattern resolves to a directory in the source worktree, `git-worktreeinclude` creates **one** symlink at the destination pointing at the source directory's absolute path; it does not recurse into the directory. Use this to share large untracked trees (caches, build outputs, vendored deps) across worktrees without duplicating bytes.
+
+When the same pattern resolves to a directory under the default `copy` mode, the directory is walked and each contained file is copied individually.
+
+### Submodules
+
+Submodules listed in `.gitmodules` (gitlink entries in the index) bypass the tracked-check, so they can be referenced from `.worktreeinclude`:
+
+- With `symlink`: a directory-level symlink is created at the destination pointing at the source submodule's working tree. This is the only supported mode.
+- With `copy` (the default when no attribute is given): the action is skipped with status `submodule_copy_unsupported`. Submodule content is not byte-copied; symlink the submodule path instead.
 
 ### Source symlinks
 
@@ -165,6 +185,7 @@ Normal execution (`apply --json`):
     "symlinked": 1,
     "skipped_same": 3,
     "skipped_missing_src": 1,
+    "skipped_submodule_copy": 0,
     "conflicts": 0,
     "errors": 0
   },
@@ -191,6 +212,7 @@ Dry-run mode (`apply --dry-run --json`):
     "symlink_planned": 1,
     "skipped_same": 3,
     "skipped_missing_src": 1,
+    "skipped_submodule_copy": 0,
     "conflicts": 0,
     "errors": 0
   },
@@ -206,8 +228,8 @@ Dry-run mode (`apply --dry-run --json`):
 - `"dry_run": true` indicates no files were written
 - In dry-run mode `"copy_planned"` / `"symlink_planned"` are used instead of `"copied"` / `"symlinked"` in the summary (they are mutually exclusive)
 - `op` is one of `copy`, `symlink`, `skip`, `conflict`
-- `status` for `skip` includes `same`, `same_link`, `missing_src`, `error`
-- `status` for `conflict` is `diff` (copy mode) or `diff_link` (symlink mode)
+- `status` for `skip` includes `same`, `same_link`, `missing_src`, `submodule_copy_unsupported` (increments `skipped_submodule_copy`), `error`
+- `status` for `conflict` is `diff` (copy mode), `diff_link` (symlink mode), or `tracked` (source or destination has tracked content; `--force` does not override)
 - `path` is repo-root relative and slash-separated
 - File contents and secrets are never output
 

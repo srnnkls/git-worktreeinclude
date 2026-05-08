@@ -45,12 +45,6 @@ func TestEngineApplyCopiesIgnoredFiles(t *testing.T) {
 	if string(gotEnv) != "SOURCE_ENV\n" {
 		t.Fatalf("unexpected .env content: %q", gotEnv)
 	}
-
-	for _, a := range res.Actions {
-		if a.Path == "README.md" {
-			t.Fatalf("tracked file must not be copied")
-		}
-	}
 }
 
 func TestEngineApplyConflictAndForce(t *testing.T) {
@@ -588,8 +582,8 @@ func TestEngineApplyDryRunIncludesMetadata(t *testing.T) {
 	if !res.IncludeFound {
 		t.Fatalf("expected include file to be found")
 	}
-	if res.PatternCount != 3 {
-		t.Fatalf("unexpected pattern count: got %d want 3", res.PatternCount)
+	if res.PatternCount != 2 {
+		t.Fatalf("unexpected pattern count: got %d want 2", res.PatternCount)
 	}
 }
 
@@ -1028,7 +1022,10 @@ func setupEngineFixture(t *testing.T) engineFixture {
 
 	writeFile(t, filepath.Join(repo, "README.md"), "tracked\n")
 	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\n.env.local\n")
-	writeFile(t, filepath.Join(repo, testIncludeFile), ".env\n.env.local\nREADME.md\n")
+	// .worktreeinclude lists only ignored paths so the regression suite can
+	// assert copy/symlink behaviors in isolation. Tracked-file refusal lives
+	// in TestSafety_TrackedSourceFileRefused.
+	writeFile(t, filepath.Join(repo, testIncludeFile), ".env\n.env.local\n")
 	runGit(t, repo, "add", "README.md", ".gitignore", testIncludeFile)
 	runGit(t, repo, "commit", "-q", "-m", "init")
 

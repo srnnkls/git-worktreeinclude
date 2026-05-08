@@ -10,7 +10,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/satococoa/git-worktreeinclude/internal/exitcode"
@@ -24,15 +23,16 @@ type Action struct {
 }
 
 type Summary struct {
-	Matched           int `json:"matched"`
-	Copied            int `json:"copied,omitempty"`
-	CopyPlanned       int `json:"copy_planned,omitempty"`
-	Symlinked         int `json:"symlinked,omitempty"`
-	SymlinkPlanned    int `json:"symlink_planned,omitempty"`
-	SkippedSame       int `json:"skipped_same"`
-	SkippedMissingSrc int `json:"skipped_missing_src"`
-	Conflicts         int `json:"conflicts"`
-	Errors            int `json:"errors"`
+	Matched              int `json:"matched"`
+	Copied               int `json:"copied,omitempty"`
+	CopyPlanned          int `json:"copy_planned,omitempty"`
+	Symlinked            int `json:"symlinked,omitempty"`
+	SymlinkPlanned       int `json:"symlink_planned,omitempty"`
+	SkippedSame          int `json:"skipped_same"`
+	SkippedMissingSrc    int `json:"skipped_missing_src"`
+	SkippedSubmoduleCopy int `json:"skipped_submodule_copy,omitempty"`
+	Conflicts            int `json:"conflicts"`
+	Errors               int `json:"errors"`
 }
 
 type Result struct {
@@ -104,8 +104,17 @@ type prepared struct {
 	includeMissingHint string
 	targetIncludePath  string
 	patternCount       int
-	matched            []string
-	symlinkSet         map[string]struct{}
+	candidates         []candidate
+	submodulePaths     map[string]struct{}
+}
+
+// candidate is one resolved entry produced by `prepare`. Each candidate maps
+// to exactly one user-visible action (copy, symlink, conflict, or skip).
+type candidate struct {
+	rel     string
+	mode    Mode
+	literal bool // came from a literal (non-glob) pattern; preserved for dir-expansion semantics
+	missing bool // literal pattern whose source path did not exist at expansion time
 }
 
 const (
@@ -122,11 +131,11 @@ func (e *Engine) Apply(ctx context.Context, cwd string, opts ApplyOptions) (Resu
 		return Result{}, errorCode(err), err
 	}
 
-	result, code := e.executePrepared(prep, opts.DryRun, opts.Force)
+	result, code := e.executePrepared(ctx, prep, opts.DryRun, opts.Force)
 	return result, code, nil
 }
 
-func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int) {
+func (e *Engine) executePrepared(ctx context.Context, prep prepared, dryRun, force bool) (Result, int) {
 	result := Result{
 		DryRun:              dryRun,
 		From:                prep.sourceRoot,
@@ -138,68 +147,30 @@ func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int
 		IncludeMissingHint:  prep.includeMissingHint,
 		TargetIncludePath:   prep.targetIncludePath,
 		PatternCount:        prep.patternCount,
-		Summary: Summary{
-			Matched: len(prep.matched),
-		},
-		Actions: make([]Action, 0, len(prep.matched)),
+		Summary:             Summary{},
+		Actions:             make([]Action, 0, len(prep.candidates)),
 	}
 
 	if !prep.includeFound {
 		return result, exitcode.OK
 	}
 
-	for _, rel := range prep.matched {
-		srcPath, err := secureJoin(prep.sourceRoot, rel)
-		if err != nil {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
-			result.Summary.Errors++
-			continue
-		}
-		dstPath, err := secureJoin(prep.targetRoot, rel)
-		if err != nil {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
-			result.Summary.Errors++
-			continue
-		}
-
-		srcInfo, err := os.Lstat(srcPath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "missing_src"})
-				result.Summary.SkippedMissingSrc++
-				continue
-			}
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
-			result.Summary.Errors++
-			continue
-		}
-
-		if srcInfo.Mode()&os.ModeSymlink != 0 {
-			linkTarget, err := os.Readlink(srcPath)
-			if err != nil {
-				result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
-				result.Summary.Errors++
-				continue
-			}
-			linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
-			applySymlink(&result, prep.targetRoot, rel, linkTarget, dstPath, dryRun, force)
-			continue
-		}
-		if !srcInfo.Mode().IsRegular() {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "missing_src"})
-			result.Summary.SkippedMissingSrc++
-			continue
-		}
-
-		if _, ok := prep.symlinkSet[rel]; ok {
-			applySymlink(&result, prep.targetRoot, rel, srcPath, dstPath, dryRun, force)
-		} else {
-			applyCopy(&result, prep.targetRoot, rel, srcPath, dstPath, srcInfo.Mode().Perm(), dryRun, force)
-		}
+	matched := 0
+	trackedConflicts := 0
+	for _, c := range prep.candidates {
+		n, tc := e.executeCandidate(ctx, &result, prep, c, dryRun, force)
+		matched += n
+		trackedConflicts += tc
 	}
+	result.Summary.Matched = matched
 
 	if result.Summary.Errors > 0 {
 		return result, exitcode.Internal
+	}
+	// Tracked conflicts are not bypassable by `--force` (refusing to clobber
+	// version-controlled content is the whole point).
+	if trackedConflicts > 0 {
+		return result, exitcode.Conflict
 	}
 	if result.Summary.Conflicts > 0 && !force {
 		return result, exitcode.Conflict
@@ -207,10 +178,175 @@ func (e *Engine) executePrepared(prep prepared, dryRun, force bool) (Result, int
 	return result, exitcode.OK
 }
 
+// executeCandidate processes a single resolved candidate, applying the
+// per-action tracked-check before any copy/symlink work. Returns the number
+// of "matched" units (a dir-copy expanded into N files contributes N) and
+// the number of tracked-status conflicts emitted (which `--force` cannot
+// override).
+func (e *Engine) executeCandidate(ctx context.Context, result *Result, prep prepared, c candidate, dryRun, force bool) (int, int) {
+	srcPath, err := secureJoin(prep.sourceRoot, c.rel)
+	if err != nil {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusError})
+		result.Summary.Errors++
+		return 1, 0
+	}
+	dstPath, err := secureJoin(prep.targetRoot, c.rel)
+	if err != nil {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusError})
+		result.Summary.Errors++
+		return 1, 0
+	}
+
+	if c.missing {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusMissingSrc})
+		result.Summary.SkippedMissingSrc++
+		return 1, 0
+	}
+
+	srcInfo, err := os.Lstat(srcPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusMissingSrc})
+			result.Summary.SkippedMissingSrc++
+			return 1, 0
+		}
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusError})
+		result.Summary.Errors++
+		return 1, 0
+	}
+
+	_, isSubmodule := prep.submodulePaths[c.rel]
+
+	// Submodule with default-copy mode is unsupported; emit a clear skip and
+	// move on without touching the destination.
+	if isSubmodule && c.mode == ModeCopy {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusSubmoduleCopyUnsupported})
+		result.Summary.SkippedSubmoduleCopy++
+		return 1, 0
+	}
+
+	// Per-action tracked-check. Submodule gitlinks legitimately appear in the
+	// index of both worktrees, so a known submodule path bypasses the check.
+	// Everything else must be untracked on both sides; `--force` does NOT
+	// override.
+	if !isSubmodule {
+		if e.isPathTracked(ctx, prep.sourceRoot, c.rel) || e.isSubtreeTracked(ctx, prep.sourceRoot, c.rel) {
+			result.Actions = append(result.Actions, Action{Op: "conflict", Path: c.rel, Status: StatusTracked})
+			result.Summary.Conflicts++
+			return 1, 1
+		}
+		if e.isPathTracked(ctx, prep.targetRoot, c.rel) || e.isSubtreeTracked(ctx, prep.targetRoot, c.rel) {
+			result.Actions = append(result.Actions, Action{Op: "conflict", Path: c.rel, Status: StatusTracked})
+			result.Summary.Conflicts++
+			return 1, 1
+		}
+	}
+
+	// Source-side symlink: recreate a symlink at destination regardless of
+	// the pattern's attribute (matches existing source-symlink semantics).
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(srcPath)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusError})
+			result.Summary.Errors++
+			return 1, 0
+		}
+		linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
+		applySymlink(result, prep.targetRoot, c.rel, linkTarget, dstPath, dryRun, force)
+		return 1, 0
+	}
+
+	// Submodule (gitlink) or directory with `symlink` attribute: emit ONE
+	// directory-level symlink, no recursion.
+	if (isSubmodule || srcInfo.IsDir()) && c.mode == ModeSymlink {
+		applySymlink(result, prep.targetRoot, c.rel, srcPath, dstPath, dryRun, force)
+		return 1, 0
+	}
+
+	if srcInfo.IsDir() {
+		// copy-mode directory: walk the source dir and emit per-file copy
+		// candidates. Negations within the dir are not supported in literal
+		// mode — users wanting fine-grained exclusion should reach for globs.
+		return e.expandDirCopy(ctx, result, prep, c.rel, srcPath, dryRun, force), 0
+	}
+
+	if !srcInfo.Mode().IsRegular() {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: c.rel, Status: StatusMissingSrc})
+		result.Summary.SkippedMissingSrc++
+		return 1, 0
+	}
+
+	if c.mode == ModeSymlink {
+		applySymlink(result, prep.targetRoot, c.rel, srcPath, dstPath, dryRun, force)
+	} else {
+		applyCopy(result, prep.targetRoot, c.rel, srcPath, dstPath, srcInfo.Mode().Perm(), dryRun, force)
+	}
+	return 1, 0
+}
+
+// expandDirCopy walks `srcDir` (a dir candidate in copy mode) and emits a
+// per-file copy action for each regular file it contains. Tracked files
+// inside the dir are skipped silently — the parent candidate already failed
+// the subtree-tracked check earlier, so reaching this point implies nothing
+// below is tracked, but we re-verify per file to be defensive.
+func (e *Engine) expandDirCopy(ctx context.Context, result *Result, prep prepared, rel, srcDir string, dryRun, force bool) int {
+	matched := 0
+	walkErr := filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		relFile, relErr := filepath.Rel(prep.sourceRoot, p)
+		if relErr != nil {
+			return relErr
+		}
+		relFile = filepath.ToSlash(relFile)
+		if e.isPathTracked(ctx, prep.sourceRoot, relFile) {
+			return nil
+		}
+		dstPath, err := secureJoin(prep.targetRoot, relFile)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: relFile, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, lerr := os.Readlink(p)
+			if lerr != nil {
+				result.Actions = append(result.Actions, Action{Op: "skip", Path: relFile, Status: StatusError})
+				result.Summary.Errors++
+				matched++
+				return nil
+			}
+			linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
+			applySymlink(result, prep.targetRoot, relFile, linkTarget, dstPath, dryRun, force)
+			matched++
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		applyCopy(result, prep.targetRoot, relFile, p, dstPath, info.Mode().Perm(), dryRun, force)
+		matched++
+		return nil
+	})
+	if walkErr != nil {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
+		result.Summary.Errors++
+		if matched == 0 {
+			matched = 1
+		}
+	}
+	return matched
+}
+
 func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os.FileMode, dryRun, force bool) {
 	dstInfo, err := os.Lstat(dstPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
 		result.Summary.Errors++
 		return
 	}
@@ -221,7 +357,7 @@ func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os
 	}
 
 	if dstInfo.IsDir() {
-		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusDiff})
 		result.Summary.Conflicts++
 		return
 	}
@@ -231,7 +367,7 @@ func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os
 		// mode so behavior matches symlink mode and so we don't silently
 		// resolve through the link.
 		if !force {
-			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
+			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusDiff})
 			result.Summary.Conflicts++
 			return
 		}
@@ -241,18 +377,18 @@ func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os
 
 	same, err := filesSame(srcPath, dstPath)
 	if err != nil {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
 		result.Summary.Errors++
 		return
 	}
 	if same {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "same"})
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusSame})
 		result.Summary.SkippedSame++
 		return
 	}
 
 	if !force {
-		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff"})
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusDiff})
 		result.Summary.Conflicts++
 		return
 	}
@@ -261,14 +397,14 @@ func applyCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os
 }
 
 func recordCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm os.FileMode, dryRun bool) {
-	status := "planned"
+	status := StatusPlanned
 	if !dryRun {
 		if err := copyFileAtomic(targetRoot, srcPath, dstPath, perm); err != nil {
-			result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: "error"})
+			result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: StatusError})
 			result.Summary.Errors++
 			return
 		}
-		status = "done"
+		status = StatusDone
 	}
 	result.Actions = append(result.Actions, Action{Op: "copy", Path: rel, Status: status})
 	if dryRun {
@@ -281,7 +417,7 @@ func recordCopy(result *Result, targetRoot, rel, srcPath, dstPath string, perm o
 func applySymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, dryRun, force bool) {
 	dstInfo, err := os.Lstat(dstPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
 		result.Summary.Errors++
 		return
 	}
@@ -292,7 +428,7 @@ func applySymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, d
 	}
 
 	if dstInfo.IsDir() {
-		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff_link"})
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusDiffLink})
 		result.Summary.Conflicts++
 		return
 	}
@@ -300,17 +436,17 @@ func applySymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, d
 	if dstInfo.Mode()&os.ModeSymlink != 0 {
 		same, err := symlinkPointsTo(dstPath, linkTarget)
 		if err != nil {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "error"})
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
 			result.Summary.Errors++
 			return
 		}
 		if same {
-			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: "same_link"})
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusSameLink})
 			result.Summary.SkippedSame++
 			return
 		}
 		if !force {
-			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff_link"})
+			result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusDiffLink})
 			result.Summary.Conflicts++
 			return
 		}
@@ -319,7 +455,7 @@ func applySymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, d
 	}
 
 	if !force {
-		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: "diff_link"})
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: rel, Status: StatusDiffLink})
 		result.Summary.Conflicts++
 		return
 	}
@@ -327,14 +463,14 @@ func applySymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, d
 }
 
 func recordSymlink(result *Result, targetRoot, rel, linkTarget, dstPath string, dryRun bool) {
-	status := "planned"
+	status := StatusPlanned
 	if !dryRun {
 		if err := symlinkAtomic(targetRoot, linkTarget, dstPath); err != nil {
-			result.Actions = append(result.Actions, Action{Op: "symlink", Path: rel, Status: "error"})
+			result.Actions = append(result.Actions, Action{Op: "symlink", Path: rel, Status: StatusError})
 			result.Summary.Errors++
 			return
 		}
-		status = "done"
+		status = StatusDone
 	}
 	result.Actions = append(result.Actions, Action{Op: "symlink", Path: rel, Status: status})
 	if dryRun {
@@ -415,44 +551,254 @@ func (e *Engine) prepare(ctx context.Context, cwd, fromOpt, includeOpt string) (
 	prep.patternCount = len(patterns)
 	prep.includeFound = true
 
+	submodules, err := e.discoverSubmodules(ctx, sourceRoot)
+	if err != nil {
+		return prepared{}, err
+	}
+	prep.submodulePaths = submodules
+
+	candidates, err := e.expandCandidates(ctx, sourceRoot, patterns)
+	if err != nil {
+		return prepared{}, err
+	}
+	prep.candidates = candidates
+	return prep, nil
+}
+
+// expandCandidates resolves parsed patterns into a list of candidates.
+//
+// Literal-path patterns lstat directly so tracked paths are visible (and can
+// be flagged as conflicts later). Glob expansion uses the legacy two-pass
+// model — full match set + symlink subset — so bucket-specific negations
+// (e.g. `!foo symlink`) keep their bucket-narrowing semantics: a path
+// excluded only from the symlink bucket falls back to copy.
+func (e *Engine) expandCandidates(ctx context.Context, sourceRoot string, patterns []Pattern) ([]candidate, error) {
 	tmpDir, err := os.MkdirTemp("", "git-worktreeinclude-include-")
 	if err != nil {
-		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to create include scratch dir", Err: err}
+		return nil, &CLIError{Code: exitcode.Env, Msg: "failed to create include scratch dir", Err: err}
 	}
 	defer func() {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	sanitizedPath, err := writeSanitizedInclude(tmpDir, patterns)
-	if err != nil {
-		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to write sanitized include file", Err: err}
+	// Per-rel state: first-seen mode wins; later positive symlink patterns
+	// upgrade to symlink, matching legacy "any symlink wins" semantics.
+	type acc struct {
+		mode    Mode
+		literal bool
+		missing bool
+	}
+	resolved := make(map[string]*acc)
+	order := make([]string, 0)
+
+	add := func(rel string, mode Mode, literal, missing bool) {
+		if existing, ok := resolved[rel]; ok {
+			if mode == ModeSymlink {
+				existing.mode = ModeSymlink
+			}
+			if literal {
+				existing.literal = true
+			}
+			// A later non-missing match clears the missing flag — the path
+			// does exist via at least one pattern.
+			if !missing {
+				existing.missing = false
+			}
+			return
+		}
+		resolved[rel] = &acc{mode: mode, literal: literal, missing: missing}
+		order = append(order, rel)
+	}
+	remove := func(rel string) {
+		if _, ok := resolved[rel]; ok {
+			delete(resolved, rel)
+			for i, p := range order {
+				if p == rel {
+					order = append(order[:i], order[i+1:]...)
+					break
+				}
+			}
+		}
 	}
 
-	ignored, err := e.listIgnored(ctx, sourceRoot, "", true)
-	if err != nil {
-		return prepared{}, err
-	}
-	included, err := e.listIgnored(ctx, sourceRoot, sanitizedPath, false)
-	if err != nil {
-		return prepared{}, err
-	}
-	prep.matched = intersectPaths(ignored, included)
-
-	subsetPath, err := writeSymlinkSubsetInclude(tmpDir, patterns)
-	if err != nil {
-		return prepared{}, &CLIError{Code: exitcode.Env, Msg: "failed to write symlink-subset include file", Err: err}
-	}
-	if subsetPath != "" {
-		symlinkPaths, err := e.listIgnored(ctx, sourceRoot, subsetPath, false)
+	// Pass 1: literal-path positives. lstat directly so tracked paths surface
+	// for the per-action tracked-check.
+	for _, p := range patterns {
+		if p.Negation || !isLiteralPattern(p.Glob) {
+			continue
+		}
+		mode := ModeCopy
+		if p.Mode != nil {
+			mode = *p.Mode
+		}
+		rel := strings.TrimSuffix(strings.TrimPrefix(p.Glob, "/"), "/")
+		abs, err := secureJoin(sourceRoot, rel)
 		if err != nil {
-			return prepared{}, err
+			continue
 		}
-		prep.symlinkSet = make(map[string]struct{}, len(symlinkPaths))
-		for _, p := range symlinkPaths {
-			prep.symlinkSet[p] = struct{}{}
+		if _, statErr := os.Lstat(abs); statErr != nil {
+			// Surface a non-existent literal path so executeCandidate can
+			// emit skip/missing_src; silently dropping it would hide the
+			// configuration error.
+			if errors.Is(statErr, os.ErrNotExist) {
+				add(rel, mode, true, true)
+			}
+			continue
+		}
+		add(rel, mode, true, false)
+	}
+
+	// Pass 2: glob expansion (legacy two-pass).
+	hasGlob := false
+	for _, p := range patterns {
+		if !p.Negation && !isLiteralPattern(p.Glob) {
+			hasGlob = true
+			break
 		}
 	}
-	return prep, nil
+	if hasGlob {
+		matchPath, err := writeSanitizedInclude(tmpDir, patterns)
+		if err != nil {
+			return nil, &CLIError{Code: exitcode.Env, Msg: "failed to write sanitized include file", Err: err}
+		}
+		matches, err := e.listOthersWithExclude(ctx, sourceRoot, matchPath)
+		if err != nil {
+			return nil, err
+		}
+
+		symlinkSet := make(map[string]struct{})
+		symlinkPath, err := writeSymlinkSubsetInclude(tmpDir, patterns)
+		if err != nil {
+			return nil, &CLIError{Code: exitcode.Env, Msg: "failed to write symlink-subset include file", Err: err}
+		}
+		if symlinkPath != "" {
+			symMatches, err := e.listOthersWithExclude(ctx, sourceRoot, symlinkPath)
+			if err != nil {
+				return nil, err
+			}
+			for _, p := range symMatches {
+				symlinkSet[p] = struct{}{}
+			}
+		}
+
+		for _, rel := range matches {
+			mode := ModeCopy
+			if _, ok := symlinkSet[rel]; ok {
+				mode = ModeSymlink
+			}
+			add(rel, mode, false, false)
+		}
+	}
+
+	// Apply literal negations to literal candidates. Glob candidates already
+	// had negations folded in via the legacy two-pass include files.
+	for _, p := range patterns {
+		if !p.Negation {
+			continue
+		}
+		raw := strings.TrimPrefix(p.Glob, "!")
+		if !isLiteralPattern(raw) {
+			continue
+		}
+		rel := strings.TrimSuffix(strings.TrimPrefix(raw, "/"), "/")
+		if a, ok := resolved[rel]; ok && a.literal {
+			remove(rel)
+		}
+	}
+
+	out := make([]candidate, 0, len(order))
+	for _, rel := range order {
+		a := resolved[rel]
+		out = append(out, candidate{rel: rel, mode: a.mode, literal: a.literal, missing: a.missing})
+	}
+	return out, nil
+}
+
+// listOthersWithExclude runs `git ls-files -o -i -X <subset>` to expand a
+// glob pattern. `-i -X subset` makes git treat the subset file as the only
+// gitignore rules in play and emit files matching them. Critically, we do
+// NOT pass `--exclude-standard` — this is what allows untracked-not-ignored
+// paths to surface when their pattern matches.
+func (e *Engine) listOthersWithExclude(ctx context.Context, repoRoot, includePath string) ([]string, error) {
+	args := []string{"ls-files", "-o", "-i", "-z"}
+	if includePath != "" {
+		args = append(args, "-X", includePath)
+	}
+	out, err := e.git.Run(ctx, repoRoot, args...)
+	if err != nil {
+		return nil, &CLIError{Code: exitcode.Env, Msg: "failed to apply include patterns", Err: err}
+	}
+	paths, err := parseNULPaths(out)
+	if err != nil {
+		return nil, &CLIError{Code: exitcode.Env, Msg: "failed to parse ls-files output", Err: err}
+	}
+	return paths, nil
+}
+
+// discoverSubmodules returns the set of submodule paths recorded in
+// `.gitmodules`, normalized to slash-separated repo-root-relative form. An
+// absent or unreadable `.gitmodules` is treated as "no submodules".
+func (e *Engine) discoverSubmodules(ctx context.Context, repoRoot string) (map[string]struct{}, error) {
+	gitmodules := filepath.Join(repoRoot, ".gitmodules")
+	if _, err := os.Stat(gitmodules); err != nil {
+		return map[string]struct{}{}, nil
+	}
+	out, err := e.git.RunText(ctx, repoRoot, "config", "--file", ".gitmodules", "--get-regexp", `^submodule\..*\.path$`)
+	if err != nil {
+		// `git config --get-regexp` exits 1 when nothing matches — not an error.
+		return map[string]struct{}{}, nil
+	}
+	paths := make(map[string]struct{})
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: "submodule.<name>.path<TAB-or-SPACE><value>"
+		idx := strings.IndexAny(line, " \t")
+		if idx < 0 {
+			continue
+		}
+		raw := strings.TrimSpace(line[idx+1:])
+		norm, normErr := normalizeRepoPath(raw)
+		if normErr != nil {
+			continue
+		}
+		// Verify the index entry mode is 160000 (gitlink) so we don't honour
+		// stale .gitmodules entries that no longer exist in the index.
+		stOut, stErr := e.git.RunText(ctx, repoRoot, "ls-files", "-s", "--", norm)
+		if stErr != nil || !strings.HasPrefix(stOut, "160000 ") {
+			continue
+		}
+		paths[norm] = struct{}{}
+	}
+	return paths, nil
+}
+
+// isPathTracked reports whether `rel` is itself tracked in the index.
+func (e *Engine) isPathTracked(ctx context.Context, repoRoot, rel string) bool {
+	_, err := e.git.Run(ctx, repoRoot, "ls-files", "--error-unmatch", "-z", "--", rel)
+	return err == nil
+}
+
+// isSubtreeTracked reports whether any tracked path lives at-or-below `rel`.
+func (e *Engine) isSubtreeTracked(ctx context.Context, repoRoot, rel string) bool {
+	out, err := e.git.Run(ctx, repoRoot, "ls-files", "-z", "--", rel)
+	if err == nil && len(bytes.TrimRight(out, "\x00")) > 0 {
+		return true
+	}
+	out, err = e.git.Run(ctx, repoRoot, "ls-files", "-z", "--", rel+"/")
+	if err == nil && len(bytes.TrimRight(out, "\x00")) > 0 {
+		return true
+	}
+	return false
+}
+
+// isLiteralPattern returns true when `glob` contains no glob metacharacters,
+// so the user almost certainly means a single concrete path.
+func isLiteralPattern(glob string) bool {
+	g := strings.TrimPrefix(glob, "!")
+	return !strings.ContainsAny(g, "*?[")
 }
 
 func (e *Engine) repoRoot(ctx context.Context, cwd string) (string, error) {
@@ -528,29 +874,6 @@ func canonicalPath(p string) string {
 		return real
 	}
 	return abs
-}
-
-func (e *Engine) listIgnored(ctx context.Context, repoRoot, includePath string, excludeStandard bool) ([]string, error) {
-	args := []string{"ls-files", "-o", "-i", "-z"}
-	if excludeStandard {
-		args = append(args, "--exclude-standard")
-	}
-	if includePath != "" {
-		args = append(args, "-X", includePath)
-	}
-	out, err := e.git.Run(ctx, repoRoot, args...)
-	if err != nil {
-		msg := "failed to list ignored files"
-		if includePath != "" {
-			msg = "failed to apply include patterns"
-		}
-		return nil, &CLIError{Code: exitcode.Env, Msg: msg, Err: err}
-	}
-	paths, err := parseNULPaths(out)
-	if err != nil {
-		return nil, &CLIError{Code: exitcode.Env, Msg: "failed to parse ignored file list", Err: err}
-	}
-	return paths, nil
 }
 
 func countPatterns(includePath string) (int, error) {
@@ -662,25 +985,6 @@ func secureJoin(root, rel string) (string, error) {
 		return "", fmt.Errorf("path escapes repository root: %s", rel)
 	}
 	return joined, nil
-}
-
-func intersectPaths(a, b []string) []string {
-	set := make(map[string]struct{}, len(a))
-	for _, p := range a {
-		set[p] = struct{}{}
-	}
-	outSet := make(map[string]struct{})
-	for _, p := range b {
-		if _, ok := set[p]; ok {
-			outSet[p] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(outSet))
-	for p := range outSet {
-		out = append(out, p)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func filesSame(srcPath, dstPath string) (bool, error) {

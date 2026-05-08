@@ -656,7 +656,7 @@ func setupFixture(t *testing.T) fixture {
 
 	writeFile(t, filepath.Join(repo, "README.md"), "tracked\n")
 	writeFile(t, filepath.Join(repo, ".gitignore"), ".env\n.env.local\n")
-	writeFile(t, filepath.Join(repo, testIncludeFile), ".env\n.env.local\nREADME.md\n")
+	writeFile(t, filepath.Join(repo, testIncludeFile), ".env\n.env.local\n")
 
 	runGit(t, repo, "add", "README.md", ".gitignore", testIncludeFile)
 	runGit(t, repo, "commit", "-q", "-m", "init")
