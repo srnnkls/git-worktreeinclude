@@ -255,8 +255,11 @@ func formatActionLine(action engine.Action, force bool) string {
 		}
 		return fmt.Sprintf("LINK      %s", action.Path)
 	case "conflict":
+		if action.Status == engine.StatusTracked {
+			return fmt.Sprintf("CONFLICT  %s (tracked; --force cannot override)", action.Path)
+		}
 		if force {
-			if action.Status == "diff_link" {
+			if action.Status == engine.StatusDiffLink {
 				return fmt.Sprintf("LINK      %s", action.Path)
 			}
 			return fmt.Sprintf("COPY      %s", action.Path)
@@ -270,9 +273,17 @@ func formatActionLine(action engine.Action, force bool) string {
 			return fmt.Sprintf("SKIP      %s (same link)", action.Path)
 		case "missing_src":
 			return fmt.Sprintf("SKIP      %s (missing source)", action.Path)
+		case engine.StatusSubmoduleCopyUnsupported:
+			return fmt.Sprintf("SKIP      %s (submodule; copy unsupported, use symlink)", action.Path)
 		default:
 			return fmt.Sprintf("ERROR     %s (processing failed)", action.Path)
 		}
+	case "expand":
+		leaves := "leaf"
+		if action.Expanded != 1 {
+			leaves = "leaves"
+		}
+		return fmt.Sprintf("WALKED    %s (%d %s)", action.Path, action.Expanded, leaves)
 	default:
 		return fmt.Sprintf("SKIP      %s", action.Path)
 	}

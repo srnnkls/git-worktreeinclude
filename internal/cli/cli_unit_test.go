@@ -160,6 +160,37 @@ func TestFormatActionLine(t *testing.T) {
 			force:  true,
 			want:   "COPY      .env",
 		},
+		{
+			name:   "conflict tracked is not --force-overridable",
+			action: engine.Action{Op: "conflict", Path: ".claude", Status: engine.StatusTracked},
+			want:   "CONFLICT  .claude (tracked; --force cannot override)",
+		},
+		{
+			name:   "conflict tracked stays explicit even with force",
+			action: engine.Action{Op: "conflict", Path: ".claude", Status: engine.StatusTracked},
+			force:  true,
+			want:   "CONFLICT  .claude (tracked; --force cannot override)",
+		},
+		{
+			name:   "expand walked rollup",
+			action: engine.Action{Op: "expand", Path: ".claude", Status: engine.StatusWalked, Expanded: 7},
+			want:   "WALKED    .claude (7 leaves)",
+		},
+		{
+			name:   "expand walked rollup singular",
+			action: engine.Action{Op: "expand", Path: ".cfg", Status: engine.StatusWalked, Expanded: 1},
+			want:   "WALKED    .cfg (1 leaf)",
+		},
+		{
+			name:   "expand walked rollup zero leaves",
+			action: engine.Action{Op: "expand", Path: ".cfg", Status: engine.StatusWalked, Expanded: 0},
+			want:   "WALKED    .cfg (0 leaves)",
+		},
+		{
+			name:   "skip submodule copy unsupported",
+			action: engine.Action{Op: "skip", Path: "vendor", Status: engine.StatusSubmoduleCopyUnsupported},
+			want:   "SKIP      vendor (submodule; copy unsupported, use symlink)",
+		},
 	}
 
 	for _, tt := range tests {
