@@ -294,6 +294,84 @@ func TestParseIncludeFileWithAttributes(t *testing.T) {
 	}
 }
 
+// TestParser_AcceptsSubmoduleWalkAttribute — a `path symlink submodule-walk`
+// line is accepted: Mode is symlink and the new SubmoduleWalk flag is true.
+// Negative cases: combining `submodule-walk` with copy mode (default or
+// explicit) MUST return a parser error containing
+// `"submodule-walk requires symlink mode"`.
+func TestParser_AcceptsSubmoduleWalkAttribute(t *testing.T) {
+	t.Run("symlink_with_submodule_walk_sets_flag", func(t *testing.T) {
+		dir := t.TempDir()
+		includePath := filepath.Join(dir, ".worktreeinclude")
+		if err := os.WriteFile(includePath, []byte("vendor/lib  symlink submodule-walk\n"), 0o644); err != nil {
+			t.Fatalf("write include: %v", err)
+		}
+
+		patterns, err := parseIncludeFile(includePath)
+		if err != nil {
+			t.Fatalf("parseIncludeFile: %v", err)
+		}
+		if len(patterns) != 1 {
+			t.Fatalf("expected 1 pattern, got %d", len(patterns))
+		}
+		p := patterns[0]
+		if p.Mode == nil || *p.Mode != ModeSymlink {
+			t.Fatalf("expected ModeSymlink, got %+v", p.Mode)
+		}
+		if !p.SubmoduleWalk {
+			t.Fatalf("expected SubmoduleWalk=true on `symlink submodule-walk`, got %+v", p)
+		}
+	})
+
+	t.Run("default_copy_with_submodule_walk_is_parse_error", func(t *testing.T) {
+		dir := t.TempDir()
+		includePath := filepath.Join(dir, ".worktreeinclude")
+		if err := os.WriteFile(includePath, []byte("vendor/lib  submodule-walk\n"), 0o644); err != nil {
+			t.Fatalf("write include: %v", err)
+		}
+
+		_, err := parseIncludeFile(includePath)
+		if err == nil {
+			t.Fatalf("expected parse error for default-copy + submodule-walk, got nil")
+		}
+		if !strings.Contains(err.Error(), "submodule-walk requires symlink mode") {
+			t.Fatalf("expected error to contain %q, got %v", "submodule-walk requires symlink mode", err)
+		}
+	})
+
+	t.Run("explicit_copy_with_submodule_walk_is_parse_error", func(t *testing.T) {
+		dir := t.TempDir()
+		includePath := filepath.Join(dir, ".worktreeinclude")
+		if err := os.WriteFile(includePath, []byte("vendor/lib  copy submodule-walk\n"), 0o644); err != nil {
+			t.Fatalf("write include: %v", err)
+		}
+
+		_, err := parseIncludeFile(includePath)
+		if err == nil {
+			t.Fatalf("expected parse error for explicit-copy + submodule-walk, got nil")
+		}
+		if !strings.Contains(err.Error(), "submodule-walk requires symlink mode") {
+			t.Fatalf("expected error to contain %q, got %v", "submodule-walk requires symlink mode", err)
+		}
+	})
+
+	t.Run("glob_with_submodule_walk_is_parse_error", func(t *testing.T) {
+		dir := t.TempDir()
+		includePath := filepath.Join(dir, ".worktreeinclude")
+		if err := os.WriteFile(includePath, []byte("vendor/*  symlink submodule-walk\n"), 0o644); err != nil {
+			t.Fatalf("write include: %v", err)
+		}
+
+		_, err := parseIncludeFile(includePath)
+		if err == nil {
+			t.Fatalf("expected parse error for glob + submodule-walk, got nil")
+		}
+		if !strings.Contains(err.Error(), "submodule-walk requires a literal pattern") {
+			t.Fatalf("expected error to contain %q, got %v", "submodule-walk requires a literal pattern", err)
+		}
+	})
+}
+
 func ptrMode(m Mode) *Mode { return &m }
 
 func TestEnsurePathWithinRootRejectsSymlinkEscape(t *testing.T) {

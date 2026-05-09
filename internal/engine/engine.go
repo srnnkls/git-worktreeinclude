@@ -120,10 +120,11 @@ type prepared struct {
 // candidate is one resolved entry produced by `prepare`. Each candidate maps
 // to exactly one user-visible action (copy, symlink, conflict, or skip).
 type candidate struct {
-	rel     string
-	mode    Mode
-	literal bool // came from a literal (non-glob) pattern; preserved for dir-expansion semantics
-	missing bool // literal pattern whose source path did not exist at expansion time
+	rel           string
+	mode          Mode
+	literal       bool // came from a literal (non-glob) pattern; preserved for dir-expansion semantics
+	missing       bool // literal pattern whose source path did not exist at expansion time
+	submoduleWalk bool // pattern requested submodule-walk: recurse into submodule WT instead of anchoring at mountpoint
 }
 
 const (
@@ -275,6 +276,10 @@ func (e *Engine) walk(ctx context.Context, result *Result, prep prepared, c cand
 			result.Summary.SkippedSubmoduleCopy++
 			return 1, false
 		}
+		if c.submoduleWalk && c.mode == ModeSymlink {
+			matched := e.walkSubmoduleContents(ctx, result, prep, c, rel, srcAbs, dstAbs, dryRun, force)
+			return matched, true
+		}
 		applySymlink(result, prep.targetRoot, rel, srcAbs, dstAbs, dryRun, force)
 		return 1, false
 	}
@@ -355,6 +360,140 @@ func (e *Engine) walkDir(ctx context.Context, result *Result, prep prepared, c c
 		matched += childMatched
 	}
 	return matched, true
+}
+
+// walkSubmoduleContents recurses into a source submodule's working tree under
+// `submodule-walk + symlink` mode. Source-side tracked-checks consult the
+// submodule's OWN index (loaded via the cache keyed by submoduleWT); target-
+// side tracked-checks continue to use the parent's index because the target
+// mountpoint sits in the parent worktree. The mountpoint itself is never
+// replaced — actions are emitted strictly inside it. The submodule's `.git`
+// gitdir-pointer at the submodule root is silently skipped. `dstAbs` is also
+// the submodule's target mountpoint and is threaded down so absolute source
+// symlinks rewrite to paths under the mountpoint, not under per-leaf dsts.
+func (e *Engine) walkSubmoduleContents(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, dryRun, force bool) int {
+	entries, err := os.ReadDir(srcAbs)
+	if err != nil {
+		result.Actions = append(result.Actions, Action{Op: "skip", Path: rel, Status: StatusError})
+		result.Summary.Errors++
+		return 1
+	}
+
+	mountDstAbs := dstAbs
+	matched := 0
+	for _, entry := range entries {
+		if entry.Name() == ".git" {
+			continue
+		}
+		childRel := strings.TrimPrefix(rel+"/"+entry.Name(), "/")
+		childSrc, err := secureJoin(srcAbs, entry.Name())
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			continue
+		}
+		childDst, err := secureJoin(prep.targetRoot, childRel)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			continue
+		}
+		childInfo, err := os.Lstat(childSrc)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			matched++
+			continue
+		}
+
+		matched += e.walkSubmoduleEntry(ctx, result, prep, c, srcAbs, entry.Name(), mountDstAbs, childRel, childSrc, childDst, childInfo, dryRun, force)
+	}
+	return matched
+}
+
+// walkSubmoduleEntry processes one entry inside a submodule-walk recursion.
+// `subWT` is the submodule's working-tree root (cache key for source tracked
+// lookups); `subRel` is the entry's path relative to that root.
+// `mountDstAbs` is the target submodule mountpoint; absolute source symlinks
+// inside the submodule rewrite under it (NOT under the per-leaf `dstAbs`),
+// so a link `<subWT>/inner/foo -> <subWT>/data/x` becomes
+// `<mountDstAbs>/inner/foo -> <mountDstAbs>/data/x`.
+func (e *Engine) walkSubmoduleEntry(ctx context.Context, result *Result, prep prepared, c candidate, subWT, subRel, mountDstAbs, childRel, srcAbs, dstAbs string, srcInfo os.FileInfo, dryRun, force bool) int {
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(srcAbs)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			return 1
+		}
+		linkTarget = rewriteAbsoluteLinkTarget(linkTarget, subWT, mountDstAbs)
+		applySymlink(result, prep.targetRoot, childRel, linkTarget, dstAbs, dryRun, force)
+		return 1
+	}
+
+	if srcInfo.IsDir() {
+		// Anchor a dir-symlink where both the submodule subtree and the
+		// parent's target subtree are fully untracked.
+		srcTracked := e.isSubtreeTracked(ctx, prep.tracked, subWT, subRel)
+		dstTracked := e.isPathTracked(ctx, prep.tracked, prep.targetRoot, childRel) || e.isSubtreeTracked(ctx, prep.tracked, prep.targetRoot, childRel)
+		if !srcTracked && !dstTracked {
+			applySymlink(result, prep.targetRoot, childRel, srcAbs, dstAbs, dryRun, force)
+			return 1
+		}
+
+		entries, err := os.ReadDir(srcAbs)
+		if err != nil {
+			result.Actions = append(result.Actions, Action{Op: "skip", Path: childRel, Status: StatusError})
+			result.Summary.Errors++
+			return 1
+		}
+		matched := 0
+		for _, entry := range entries {
+			grandSubRel := strings.TrimPrefix(subRel+"/"+entry.Name(), "/")
+			grandChildRel := strings.TrimPrefix(childRel+"/"+entry.Name(), "/")
+			grandSrc, err := secureJoin(srcAbs, entry.Name())
+			if err != nil {
+				result.Actions = append(result.Actions, Action{Op: "skip", Path: grandChildRel, Status: StatusError})
+				result.Summary.Errors++
+				matched++
+				continue
+			}
+			grandDst, err := secureJoin(prep.targetRoot, grandChildRel)
+			if err != nil {
+				result.Actions = append(result.Actions, Action{Op: "skip", Path: grandChildRel, Status: StatusError})
+				result.Summary.Errors++
+				matched++
+				continue
+			}
+			grandInfo, err := os.Lstat(grandSrc)
+			if err != nil {
+				result.Actions = append(result.Actions, Action{Op: "skip", Path: grandChildRel, Status: StatusError})
+				result.Summary.Errors++
+				matched++
+				continue
+			}
+			matched += e.walkSubmoduleEntry(ctx, result, prep, c, subWT, grandSubRel, mountDstAbs, grandChildRel, grandSrc, grandDst, grandInfo, dryRun, force)
+		}
+		return matched
+	}
+
+	// Leaf file: source-tracked uses the SUBMODULE's index; target-tracked
+	// uses the parent's. A submodule-tracked leaf produces no action.
+	if e.isPathTracked(ctx, prep.tracked, subWT, subRel) {
+		return 0
+	}
+	if !srcInfo.Mode().IsRegular() {
+		return 0
+	}
+	if e.isPathTracked(ctx, prep.tracked, prep.targetRoot, childRel) {
+		result.Actions = append(result.Actions, Action{Op: "conflict", Path: childRel, Status: StatusTracked})
+		result.Summary.Conflicts++
+		return 1
+	}
+	applySymlink(result, prep.targetRoot, childRel, srcAbs, dstAbs, dryRun, force)
+	return 1
 }
 
 // walkLeafFile handles a non-directory, non-submodule, non-source-symlink
@@ -641,14 +780,15 @@ func (e *Engine) expandCandidates(ctx context.Context, sourceRoot string, patter
 	// Per-rel state: first-seen mode wins; later positive symlink patterns
 	// upgrade to symlink, matching legacy "any symlink wins" semantics.
 	type acc struct {
-		mode    Mode
-		literal bool
-		missing bool
+		mode          Mode
+		literal       bool
+		missing       bool
+		submoduleWalk bool
 	}
 	resolved := make(map[string]*acc)
 	order := make([]string, 0)
 
-	add := func(rel string, mode Mode, literal, missing bool) {
+	add := func(rel string, mode Mode, literal, missing, submoduleWalk bool) {
 		if existing, ok := resolved[rel]; ok {
 			if mode == ModeSymlink {
 				existing.mode = ModeSymlink
@@ -661,9 +801,12 @@ func (e *Engine) expandCandidates(ctx context.Context, sourceRoot string, patter
 			if !missing {
 				existing.missing = false
 			}
+			if submoduleWalk {
+				existing.submoduleWalk = true
+			}
 			return
 		}
-		resolved[rel] = &acc{mode: mode, literal: literal, missing: missing}
+		resolved[rel] = &acc{mode: mode, literal: literal, missing: missing, submoduleWalk: submoduleWalk}
 		order = append(order, rel)
 	}
 	remove := func(rel string) {
@@ -698,11 +841,11 @@ func (e *Engine) expandCandidates(ctx context.Context, sourceRoot string, patter
 			// emit skip/missing_src; silently dropping it would hide the
 			// configuration error.
 			if errors.Is(statErr, os.ErrNotExist) {
-				add(rel, mode, true, true)
+				add(rel, mode, true, true, p.SubmoduleWalk)
 			}
 			continue
 		}
-		add(rel, mode, true, false)
+		add(rel, mode, true, false, p.SubmoduleWalk)
 	}
 
 	// Pass 2: glob expansion (legacy two-pass).
@@ -743,7 +886,7 @@ func (e *Engine) expandCandidates(ctx context.Context, sourceRoot string, patter
 			if _, ok := symlinkSet[rel]; ok {
 				mode = ModeSymlink
 			}
-			add(rel, mode, false, false)
+			add(rel, mode, false, false, false)
 		}
 	}
 
@@ -766,7 +909,13 @@ func (e *Engine) expandCandidates(ctx context.Context, sourceRoot string, patter
 	out := make([]candidate, 0, len(order))
 	for _, rel := range order {
 		a := resolved[rel]
-		out = append(out, candidate{rel: rel, mode: a.mode, literal: a.literal, missing: a.missing})
+		out = append(out, candidate{
+			rel:           rel,
+			mode:          a.mode,
+			literal:       a.literal,
+			missing:       a.missing,
+			submoduleWalk: a.submoduleWalk,
+		})
 	}
 	return out, nil
 }

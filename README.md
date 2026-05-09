@@ -70,6 +70,7 @@ Recognized attributes:
 
 - `copy` (default): the matched path is byte-copied into the target worktree.
 - `symlink`: the target gets a symlink pointing at the absolute path of the source file in the source worktree.
+- `submodule-walk`: only valid alongside `symlink`, and only on a literal (non-glob) pattern. Recurses into the source submodule's working tree and emits per-leaf actions inside the target's existing mountpoint instead of replacing the mountpoint with one directory-level symlink. Combining `submodule-walk` with `copy` (default or explicit) is rejected at parse time with the error `submodule-walk requires symlink mode`; pairing it with a glob is rejected with `submodule-walk requires a literal pattern`. See [Submodules](#submodules) for the full contract.
 
 If both `copy` and `symlink` appear on the same line, `symlink` wins. Unknown attributes (e.g. `binary`, `eol=lf`, `export-ignore`, `key=value`) are accepted and ignored, so this file format stays forward-compatible and can sit next to (or share content with) `.gitattributes`-style metadata.
 
@@ -113,8 +114,16 @@ When the same pattern resolves to a directory under the default `copy` mode, the
 
 Submodules listed in `.gitmodules` (gitlink entries in the index) bypass the tracked-check, so they can be referenced from `.worktreeinclude`:
 
-- With `symlink`: a directory-level symlink is created at the destination pointing at the source submodule's working tree. This is the only supported mode.
+- With `symlink`: a directory-level symlink is created at the destination pointing at the source submodule's working tree. This is the default behavior and the only mode that materializes the submodule with a single action.
 - With `copy` (the default when no attribute is given): the action is skipped with status `submodule_copy_unsupported`. Submodule content is not byte-copied; symlink the submodule path instead.
+- With `symlink submodule-walk`: the walker recurses into the source submodule's working tree and emits per-leaf actions inside the target's existing mountpoint rather than anchoring a single dir-level symlink at the mountpoint. Use this when target already needs a real directory at the mountpoint (e.g. it carries local-only files alongside the submodule contents). Specifics:
+  - Requires `symlink` mode. `copy submodule-walk` and bare `submodule-walk` (default-copy) are parser errors (`submodule-walk requires symlink mode`).
+  - Requires a literal (non-glob) pattern. Globs like `vendor/*  symlink submodule-walk` are rejected at parse time (`submodule-walk requires a literal pattern`) because glob expansion uses `git ls-files`, which does not see content inside submodules.
+  - Source-side tracked-checks consult the **submodule's own** index, not the parent repo's. A file tracked only inside the submodule is silently skipped, exactly like a tracked source leaf in a normal walk.
+  - Target-side tracked-checks continue to use the parent repo's index because the mountpoint sits in the parent worktree.
+  - The submodule's `.git` gitdir-pointer file at the submodule root is silently skipped — no leaf, no skip, no conflict, no error. As a consequence, `git submodule status` in the target reports the submodule as **uninitialised**, and `git submodule update --init` in the target is not expected to do anything meaningful when the mountpoint is already populated by `submodule-walk`. This is the explicit tradeoff: the target gets the submodule's content without becoming a second submodule checkout.
+  - The mountpoint itself stays a real directory; it is never replaced with a symlink. Per-leaf symlinks land inside it.
+  - Like the regular walker, `.worktreeinclude` negation lines (`!foo`) are evaluated at candidate-resolution time and do not propagate into the submodule walk.
 
 ### Source symlinks
 

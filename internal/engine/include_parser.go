@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -14,8 +15,9 @@ const (
 )
 
 const (
-	attrCopy    = "copy"
-	attrSymlink = "symlink"
+	attrCopy          = "copy"
+	attrSymlink       = "symlink"
+	attrSubmoduleWalk = "submodule-walk"
 )
 
 // Pattern is one parsed line of a `.worktreeinclude` file. Glob retains any
@@ -24,11 +26,12 @@ const (
 // or not). Mode is nil when no recognized mode attribute was present, which
 // is distinct from an explicit `copy` attribute.
 type Pattern struct {
-	Raw      string
-	Glob     string
-	Negation bool
-	Mode     *Mode
-	Attrs    []string
+	Raw           string
+	Glob          string
+	Negation      bool
+	Mode          *Mode
+	Attrs         []string
+	SubmoduleWalk bool
 }
 
 func parseIncludeFile(path string) ([]Pattern, error) {
@@ -56,12 +59,22 @@ func parseIncludeFile(path string) ([]Pattern, error) {
 			continue
 		}
 
+		mode := resolveMode(attrs)
+		submoduleWalk := hasSubmoduleWalk(attrs)
+		if submoduleWalk && (mode == nil || *mode != ModeSymlink) {
+			return nil, fmt.Errorf("submodule-walk requires symlink mode (line: %q)", line)
+		}
+		if submoduleWalk && !isLiteralPattern(glob) {
+			return nil, fmt.Errorf("submodule-walk requires a literal pattern (line: %q)", line)
+		}
+
 		patterns = append(patterns, Pattern{
-			Raw:      line,
-			Glob:     glob,
-			Negation: strings.HasPrefix(glob, "!"),
-			Mode:     resolveMode(attrs),
-			Attrs:    attrs,
+			Raw:           line,
+			Glob:          glob,
+			Negation:      strings.HasPrefix(glob, "!"),
+			Mode:          mode,
+			Attrs:         attrs,
+			SubmoduleWalk: submoduleWalk,
 		})
 	}
 	if err := s.Err(); err != nil {
@@ -79,6 +92,17 @@ func splitPatternAndAttrs(line string) (glob string, attrs []string) {
 		return "", nil
 	}
 	return fields[0], fields[1:]
+}
+
+// hasSubmoduleWalk reports whether the per-pattern attributes list contains
+// the literal `submodule-walk` token.
+func hasSubmoduleWalk(attrs []string) bool {
+	for _, a := range attrs {
+		if a == attrSubmoduleWalk {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveMode picks the copy/symlink mode for a pattern. Unknown attribute
