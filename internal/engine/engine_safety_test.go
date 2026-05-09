@@ -537,6 +537,10 @@ func setupSubmoduleFixture(t *testing.T, relPath string) engineFixture {
 	runGitTB(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", upstreamURL, relPath)
 	runGitTB(t, repo, "commit", "-q", "-m", "add submodule "+relPath)
 
+	subWT := filepath.Join(repo, relPath)
+	runGitTB(t, subWT, "config", "user.name", "Test User")
+	runGitTB(t, subWT, "config", "user.email", "test@example.com")
+
 	// Target worktree.
 	wt := filepath.Join(base, "wt")
 	runGitTB(t, repo, "worktree", "add", "-q", wt, "-b", "feature")
