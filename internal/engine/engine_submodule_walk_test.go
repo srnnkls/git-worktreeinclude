@@ -12,10 +12,12 @@ import (
 )
 
 // TestSubmoduleWalk_PartialTreeAnchorsLeaves — a submodule pattern marked
-// `submodule-walk` recurses into the submodule's working tree. Per-leaf
-// symlinks land INSIDE the existing target mountpoint dir; source-tracked
-// submodule files generate no actions; an `expand/walked` rollup is emitted
-// at the mountpoint and exit code is OK.
+// `submodule-walk` shares the submodule's WT (sans `.git`) with target.
+// Per-leaf symlinks land INSIDE the existing target mountpoint dir for
+// every entry the target lacks; an `expand/walked` rollup is emitted at the
+// mountpoint and exit code is OK. Submodule-tracked files are NOT silently
+// skipped — they live only in source's initialised submodule, so target
+// needs them.
 func TestSubmoduleWalk_PartialTreeAnchorsLeaves(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink and submodule semantics vary on Windows")
@@ -25,8 +27,8 @@ func TestSubmoduleWalk_PartialTreeAnchorsLeaves(t *testing.T) {
 
 	// `vendor/lib` already has `lib.txt` tracked in the SUBMODULE'S index
 	// (committed in setupSubmoduleFixture's upstream repo). Add an untracked
-	// sibling inside the submodule working tree so the walker has at least
-	// one leaf to symlink. The submodule's own .gitignore makes it ignored.
+	// sibling inside the submodule working tree alongside it. The submodule's
+	// own .gitignore makes it ignored.
 	subWT := filepath.Join(fx.root, "vendor", "lib")
 	writeFile(t, filepath.Join(subWT, ".gitignore"), "build.log\n")
 	runGit(t, subWT, "add", ".gitignore")
@@ -86,11 +88,27 @@ func TestSubmoduleWalk_PartialTreeAnchorsLeaves(t *testing.T) {
 		t.Fatalf("vendor/lib/build.log should be a symlink, mode=%v", leafInfo.Mode())
 	}
 
-	// Source-tracked submodule file (lib.txt is tracked in the submodule's
-	// index) must NOT generate an action — submodule's own tracked set is
-	// authoritative for the recursion.
-	if a := findActionOptional(res.Actions, "vendor/lib/lib.txt"); a.Op != "" {
-		t.Fatalf("submodule-tracked leaf must produce no action, got %+v", a)
+	// Submodule-tracked file `lib.txt` lives only in source's initialised
+	// submodule WT — target needs it. Walker MUST emit a symlink/done action
+	// for it (or anchor a parent dir-symlink covering it).
+	libAction := findAction(t, res.Actions, "vendor/lib/lib.txt")
+	if libAction.Op != "symlink" || libAction.Status != "done" {
+		t.Fatalf("expected symlink/done for vendor/lib/lib.txt (submodule-tracked content must be shared), got %+v", libAction)
+	}
+	libPath := filepath.Join(mountTgt, "lib.txt")
+	libInfo, err := os.Lstat(libPath)
+	if err != nil {
+		t.Fatalf("lstat vendor/lib/lib.txt in target: %v", err)
+	}
+	if libInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("vendor/lib/lib.txt in target should be a symlink, mode=%v", libInfo.Mode())
+	}
+	got, err := os.ReadFile(libPath)
+	if err != nil {
+		t.Fatalf("read vendor/lib/lib.txt through target symlink: %v", err)
+	}
+	if string(got) != "LIB\n" {
+		t.Fatalf("vendor/lib/lib.txt content via target symlink = %q, want %q", string(got), "LIB\n")
 	}
 }
 
@@ -258,9 +276,6 @@ func TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToSourceAbsolute(t *testing
 	fx := setupSubmoduleFixture(t, "vendor/lib")
 
 	subWT := filepath.Join(fx.root, "vendor", "lib")
-	// Track sentinels inside `inner/` and `data/` so neither directory can be
-	// anchored as a single dir-symlink by the submodule walker; the walker
-	// must then recurse and visit the absolute symlink itself.
 	innerDir := filepath.Join(subWT, "inner")
 	dataDir := filepath.Join(subWT, "data")
 	if err := os.MkdirAll(innerDir, 0o755); err != nil {
@@ -284,6 +299,12 @@ func TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToSourceAbsolute(t *testing
 	mountTgt := filepath.Join(fx.wt, "vendor", "lib")
 	if err := os.MkdirAll(mountTgt, 0o755); err != nil {
 		t.Fatalf("mkdir target mountpoint: %v", err)
+	}
+	// Pre-create target's `inner/` so the walker descends into it and
+	// rewrites the absolute symlink at the per-leaf visit, rather than
+	// covering it with a single dir-symlink at `inner/`.
+	if err := os.MkdirAll(filepath.Join(mountTgt, "inner"), 0o755); err != nil {
+		t.Fatalf("mkdir target inner/: %v", err)
 	}
 
 	writeFile(t, filepath.Join(fx.root, testIncludeFile), "vendor/lib  symlink submodule-walk\n")
@@ -333,15 +354,17 @@ func TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToSourceAbsolute(t *testing
 	}
 }
 
-// TestSubmoduleWalk_SubmoduleTrackedSetIsIndependent — when the walker
-// recurses into a submodule under `submodule-walk`, the tracked-set lookup
-// must use the SUBMODULE's own index, not the parent repo's. A file that is
-// tracked in the submodule but absent from the parent's index must NOT be
-// turned into a symlink (the submodule's tracked set excludes it).
+// TestSubmoduleWalk_SubmoduleTrackedContentIsShared — files tracked inside
+// the submodule's own index live ONLY in source's initialised submodule WT.
+// Target's mountpoint is empty after `git checkout` (the submodule is
+// uninitialised on target's side), so the walker MUST share submodule-tracked
+// content with target. Silently skipping it leaves the target with almost
+// nothing of the submodule.
 //
-// This is the precise test that catches an implementation that accidentally
-// re-uses prep.tracked (parent-rooted) inside the submodule walk.
-func TestSubmoduleWalk_SubmoduleTrackedSetIsIndependent(t *testing.T) {
+// Concretely: a file tracked in the submodule's index gets a leaf-level
+// action (or is reachable through a parent dir-symlink), and target's path
+// resolves to the source's tracked file.
+func TestSubmoduleWalk_SubmoduleTrackedContentIsShared(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink and submodule semantics vary on Windows")
 	}
@@ -349,9 +372,7 @@ func TestSubmoduleWalk_SubmoduleTrackedSetIsIndependent(t *testing.T) {
 	fx := setupSubmoduleFixture(t, "vendor/lib")
 
 	subWT := filepath.Join(fx.root, "vendor", "lib")
-	// Create and commit a file that is tracked ONLY in the submodule's index.
-	// The parent repo never sees it (the submodule shows up in the parent
-	// index as a single gitlink commit).
+	// Tracked-only-in-submodule file. The parent repo never sees it.
 	innerDir := filepath.Join(subWT, "inner")
 	if err := os.MkdirAll(innerDir, 0o755); err != nil {
 		t.Fatalf("mkdir submodule inner/: %v", err)
@@ -360,6 +381,8 @@ func TestSubmoduleWalk_SubmoduleTrackedSetIsIndependent(t *testing.T) {
 	runGit(t, subWT, "add", "inner/tracked-only-in-sub.txt")
 	runGit(t, subWT, "commit", "-q", "-m", "track inner/tracked-only-in-sub.txt in submodule")
 
+	// Target's mountpoint is empty — the submodule is uninitialised on
+	// target's side. This is the realistic post-`git checkout` state.
 	mountTgt := filepath.Join(fx.wt, "vendor", "lib")
 	if err := os.MkdirAll(mountTgt, 0o755); err != nil {
 		t.Fatalf("mkdir target mountpoint: %v", err)
@@ -367,38 +390,50 @@ func TestSubmoduleWalk_SubmoduleTrackedSetIsIndependent(t *testing.T) {
 
 	writeFile(t, filepath.Join(fx.root, testIncludeFile), "vendor/lib  symlink submodule-walk\n")
 
-	res, _, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
 		From:    "auto",
 		Include: testIncludeFile,
 	})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-
-	// The submodule-tracked file must NOT have a symlink action. If the
-	// implementation incorrectly checks the PARENT's tracked set, it would
-	// see "untracked at parent" and emit a symlink/done.
-	if action := findActionOptional(res.Actions, "vendor/lib/inner/tracked-only-in-sub.txt"); action.Op == "symlink" {
-		t.Fatalf("walker used parent's tracked set instead of submodule's: emitted %+v for a submodule-tracked file", action)
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
 	}
-	// And no symlink should have been written on disk for it.
-	if info, err := os.Lstat(filepath.Join(mountTgt, "inner", "tracked-only-in-sub.txt")); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			t.Fatalf("walker created a symlink for a submodule-tracked file (%v)", info.Mode())
-		}
+
+	// Target's `vendor/lib/inner/tracked-only-in-sub.txt` must resolve to a
+	// readable file containing the tracked content. Whether the action is
+	// emitted at the leaf or covered by a dir-symlink at `vendor/lib/inner`
+	// is an implementation detail; the contract is that the file is shared.
+	leafPath := filepath.Join(mountTgt, "inner", "tracked-only-in-sub.txt")
+	got, err := os.ReadFile(leafPath)
+	if err != nil {
+		t.Fatalf("read shared submodule-tracked file at target: %v (actions=%+v)", err, res.Actions)
+	}
+	if string(got) != "SUB_TRACKED\n" {
+		t.Fatalf("shared submodule-tracked content mismatch: got %q, want %q", string(got), "SUB_TRACKED\n")
+	}
+
+	// And the walker must NOT have silently skipped the submodule-tracked
+	// content: at minimum, the parent dir or the leaf produced an action.
+	leafAction := findActionOptional(res.Actions, "vendor/lib/inner/tracked-only-in-sub.txt")
+	innerAction := findActionOptional(res.Actions, "vendor/lib/inner")
+	if leafAction.Op == "" && innerAction.Op == "" {
+		t.Fatalf("walker silently skipped submodule-tracked content: no action at vendor/lib/inner or vendor/lib/inner/tracked-only-in-sub.txt (all=%+v)", res.Actions)
 	}
 }
 
 // TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute — a
-// relative symlink inside a source submodule that crosses into a
-// source-tracked sibling must be rewritten to an absolute path resolving
-// inside the SOURCE submodule WT. The submodule walker silently skips
-// submodule-tracked leaves, so the target tree does NOT mirror the
-// submodule's tree; preserving the verbatim relative target would resolve
-// through paths that target never materializes.
+// relative symlink inside a source submodule that crosses into a sibling
+// subtree must be rewritten to an absolute path resolving inside the SOURCE
+// submodule WT. The walker rewrites verbatim-relative targets at every
+// per-leaf visit because the relative path is computed against the source's
+// layout — the recreated link in target may sit beside dir-symlinks rather
+// than real subdirs, and the absolute form is the form that survives any
+// such reshuffling.
 //
 // Reproducer drawn from the user's `effect/` submodule report: an untracked
-// fixture file links across into a tracked sibling subtree.
+// fixture file links across into a sibling subtree.
 func TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink and submodule semantics vary on Windows")
@@ -416,16 +451,12 @@ func TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing
 		t.Fatalf("mkdir inner: %v", err)
 	}
 
-	// `data/x.txt` is tracked in the SUBMODULE'S index — the walker will
-	// silently skip it, leaving the target without `vendor/lib/data/x.txt`.
 	writeFile(t, filepath.Join(dataDir, "x.txt"), "X\n")
-	// Sentinel inside `inner/` so the dir is partial-tracked; the walker
-	// must recurse and visit the relative symlink rather than anchor.
 	writeFile(t, filepath.Join(innerDir, "tracked.txt"), "T\n")
 	runGit(t, subWT, "add", "data/x.txt", "inner/tracked.txt")
 	runGit(t, subWT, "commit", "-q", "-m", "track data/x.txt and inner/tracked.txt")
 
-	// Untracked relative symlink crossing the tracked/untracked boundary.
+	// Untracked relative symlink crossing into a sibling subtree.
 	if err := os.Symlink("../data/x.txt", filepath.Join(innerDir, "foo")); err != nil {
 		t.Fatalf("create relative symlink: %v", err)
 	}
@@ -433,6 +464,12 @@ func TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing
 	mountTgt := filepath.Join(fx.wt, "vendor", "lib")
 	if err := os.MkdirAll(mountTgt, 0o755); err != nil {
 		t.Fatalf("mkdir target mountpoint: %v", err)
+	}
+	// Pre-create target's `inner/` so the walker must descend into it (and
+	// visit the relative symlink at the leaf) rather than anchor it as a
+	// single dir-symlink.
+	if err := os.MkdirAll(filepath.Join(mountTgt, "inner"), 0o755); err != nil {
+		t.Fatalf("mkdir target inner/: %v", err)
 	}
 
 	writeFile(t, filepath.Join(fx.root, testIncludeFile), "vendor/lib  symlink submodule-walk\n")
@@ -444,12 +481,6 @@ func TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing
 		t.Fatalf("Apply: %v", err)
 	} else if code != exitcode.OK {
 		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
-	}
-
-	// Target must NOT have the tracked sibling — the walker silently skipped
-	// it, which is precisely why a verbatim relative link would be broken.
-	if _, err := os.Lstat(filepath.Join(mountTgt, "data", "x.txt")); err == nil {
-		t.Fatalf("precondition broken: target unexpectedly has data/x.txt; the walker was supposed to skip it")
 	}
 
 	recreated := filepath.Join(mountTgt, "inner", "foo")
@@ -481,5 +512,93 @@ func TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing
 	}
 	if filepath.Clean(gotResolved) != filepath.Clean(wantResolved) {
 		t.Fatalf("recreated symlink must resolve through the source submodule:\n  got:  %s\n  want: %s", gotResolved, wantResolved)
+	}
+}
+
+// TestSubmoduleWalk_AnchorsTopLevelSubdirsAsSingleSymlinks — when target's
+// mountpoint is empty (the realistic post-`git checkout` state) and source
+// has populated subdirectories under the submodule WT, each top-level subdir
+// where target's path is absent anchors as a SINGLE dir-symlink rather than
+// fanning out to per-file leaves. This pins the "anchor at fully-shareable
+// subtree" semantics: when target has nothing at the path, sharing the whole
+// subtree via one symlink is correct (and dramatically reduces action count
+// on real-world submodules with thousands of files).
+func TestSubmoduleWalk_AnchorsTopLevelSubdirsAsSingleSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink and submodule semantics vary on Windows")
+	}
+
+	fx := setupSubmoduleFixture(t, "vendor/lib")
+
+	subWT := filepath.Join(fx.root, "vendor", "lib")
+
+	// Populate two top-level subdirs each with multiple tracked files.
+	pkgFoo := filepath.Join(subWT, "packages", "foo")
+	pkgQux := filepath.Join(subWT, "packages", "qux")
+	if err := os.MkdirAll(pkgFoo, 0o755); err != nil {
+		t.Fatalf("mkdir packages/foo: %v", err)
+	}
+	if err := os.MkdirAll(pkgQux, 0o755); err != nil {
+		t.Fatalf("mkdir packages/qux: %v", err)
+	}
+	writeFile(t, filepath.Join(pkgFoo, "bar.ts"), "BAR\n")
+	writeFile(t, filepath.Join(pkgFoo, "baz.ts"), "BAZ\n")
+	writeFile(t, filepath.Join(pkgQux, "main.ts"), "MAIN\n")
+	runGit(t, subWT, "add",
+		"packages/foo/bar.ts",
+		"packages/foo/baz.ts",
+		"packages/qux/main.ts",
+	)
+	runGit(t, subWT, "commit", "-q", "-m", "track packages/")
+
+	// Target's mountpoint exists but is empty (uninitialised submodule).
+	mountTgt := filepath.Join(fx.wt, "vendor", "lib")
+	if err := os.MkdirAll(mountTgt, 0o755); err != nil {
+		t.Fatalf("mkdir target mountpoint: %v", err)
+	}
+
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "vendor/lib  symlink submodule-walk\n")
+
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+
+	// `vendor/lib/packages` must be ONE symlink, not 3 individual file leaves.
+	pkgPath := filepath.Join(mountTgt, "packages")
+	pkgInfo, err := os.Lstat(pkgPath)
+	if err != nil {
+		t.Fatalf("lstat target packages dir: %v (actions=%+v)", err, res.Actions)
+	}
+	if pkgInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("target's vendor/lib/packages must be a single dir-symlink, got mode=%v", pkgInfo.Mode())
+	}
+
+	// And the action set: one symlink/done at vendor/lib/packages, NO
+	// separate file-leaf actions under it.
+	pkgAction := findAction(t, res.Actions, "vendor/lib/packages")
+	if pkgAction.Op != "symlink" || pkgAction.Status != "done" {
+		t.Fatalf("expected symlink/done at vendor/lib/packages, got %+v", pkgAction)
+	}
+	for _, a := range res.Actions {
+		if strings.HasPrefix(a.Path, "vendor/lib/packages/") {
+			t.Fatalf("anchor must not fan out to per-file leaves under packages/, got %+v", a)
+		}
+	}
+
+	// And the recreated symlink must point at the SOURCE submodule's
+	// `<subWT>/packages` — verify content reaches through.
+	got, err := os.ReadFile(filepath.Join(pkgPath, "foo", "bar.ts"))
+	if err != nil {
+		t.Fatalf("read packages/foo/bar.ts through dir-symlink: %v", err)
+	}
+	if string(got) != "BAR\n" {
+		t.Fatalf("packages/foo/bar.ts content via dir-symlink = %q, want %q", string(got), "BAR\n")
 	}
 }

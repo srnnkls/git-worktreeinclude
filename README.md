@@ -116,13 +116,13 @@ Submodules listed in `.gitmodules` (gitlink entries in the index) bypass the tra
 
 - With `symlink`: a directory-level symlink is created at the destination pointing at the source submodule's working tree. This is the default behavior and the only mode that materializes the submodule with a single action.
 - With `copy` (the default when no attribute is given): the action is skipped with status `submodule_copy_unsupported`. Submodule content is not byte-copied; symlink the submodule path instead.
-- With `symlink submodule-walk`: the walker recurses into the source submodule's working tree and emits per-leaf actions inside the target's existing mountpoint rather than anchoring a single dir-level symlink at the mountpoint. Use this when target already needs a real directory at the mountpoint (e.g. it carries local-only files alongside the submodule contents). Specifics:
+- With `symlink submodule-walk`: the walker shares the source submodule's entire working tree (sans `.git`) with target, emitting actions inside the target's existing mountpoint rather than anchoring a single dir-level symlink at the mountpoint. Use this when target already needs a real directory at the mountpoint (e.g. it carries local-only files alongside the submodule contents). Specifics:
   - Requires `symlink` mode. `copy submodule-walk` and bare `submodule-walk` (default-copy) are parser errors (`submodule-walk requires symlink mode`).
   - Requires a literal (non-glob) pattern. Globs like `vendor/*  symlink submodule-walk` are rejected at parse time (`submodule-walk requires a literal pattern`) because glob expansion uses `git ls-files`, which does not see content inside submodules.
-  - Source-side tracked-checks consult the **submodule's own** index, not the parent repo's. A file tracked only inside the submodule is silently skipped, exactly like a tracked source leaf in a normal walk.
-  - Target-side tracked-checks continue to use the parent repo's index because the mountpoint sits in the parent worktree.
+  - Top-level entries inside the submodule WT anchor as single dir-symlinks where target's path is absent; recursion only happens when target already has real content at the same path. Submodule-tracked content is shared the same way as untracked content — both live only in source's initialised submodule WT, so target needs access to both.
+  - Target-side tracked content at the same leaf path produces `conflict/tracked` (rare in practice — the mountpoint is typically empty after `git checkout`). Target-side tracked-checks use the parent repo's index because the mountpoint sits in the parent worktree.
   - The submodule's `.git` gitdir-pointer file at the submodule root is silently skipped — no leaf, no skip, no conflict, no error. As a consequence, `git submodule status` in the target reports the submodule as **uninitialised**, and `git submodule update --init` in the target is not expected to do anything meaningful when the mountpoint is already populated by `submodule-walk`. This is the explicit tradeoff: the target gets the submodule's content without becoming a second submodule checkout.
-  - The mountpoint itself stays a real directory; it is never replaced with a symlink. Per-leaf symlinks land inside it.
+  - The mountpoint itself stays a real directory; it is never replaced with a symlink. Per-leaf and per-subdir symlinks land inside it.
   - Like the regular walker, `.worktreeinclude` negation lines (`!foo`) are evaluated at candidate-resolution time and do not propagate into the submodule walk.
 
 ### Source symlinks

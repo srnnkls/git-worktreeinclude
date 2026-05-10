@@ -375,14 +375,17 @@ func (e *Engine) walkDir(ctx context.Context, result *Result, prep prepared, c c
 }
 
 // walkSubmoduleContents recurses into a source submodule's working tree under
-// `submodule-walk + symlink` mode. Source-side tracked-checks consult the
-// submodule's OWN index (loaded via the cache keyed by submoduleWT); target-
-// side tracked-checks continue to use the parent's index because the target
-// mountpoint sits in the parent worktree. The mountpoint itself is never
-// replaced — actions are emitted strictly inside it. The submodule's `.git`
-// gitdir-pointer at the submodule root is silently skipped. `dstAbs` is also
-// the submodule's target mountpoint and is threaded down so absolute source
-// symlinks rewrite to paths under the mountpoint, not under per-leaf dsts.
+// `submodule-walk + symlink` mode. The submodule's entire WT (sans `.git`)
+// is shared with target: top-level subdirs anchor as single dir-symlinks
+// where target's path is absent, recursion only happens when target already
+// has real content at the same path. Tracked-vs-untracked distinction inside
+// the submodule WT is irrelevant — submodule-tracked content lives only in
+// source's initialised submodule, so target needs it. Target-side tracked
+// content at the same leaf path still produces `conflict/tracked` (rare,
+// since the mountpoint is typically empty after `git checkout`). The
+// submodule's `.git` gitdir-pointer at the submodule root is silently
+// skipped. `dstAbs` is the submodule's target mountpoint and is threaded
+// down so absolute source symlinks rewrite to source-rooted paths.
 func (e *Engine) walkSubmoduleContents(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, dryRun, force bool) int {
 	entries, err := os.ReadDir(srcAbs)
 	if err != nil {
@@ -426,17 +429,22 @@ func (e *Engine) walkSubmoduleContents(ctx context.Context, result *Result, prep
 }
 
 // walkSubmoduleEntry processes one entry inside a submodule-walk recursion.
-// `subWT` is the submodule's working-tree root (cache key for source tracked
-// lookups); `subRel` is the entry's path relative to that root.
-// `mountDstAbs` is the target submodule mountpoint, threaded through to
-// grand-recursions for symmetry with `walkSubmoduleContents`.
+// `subWT` is the submodule's working-tree root; `subRel` is the entry's path
+// relative to that root. `mountDstAbs` is the target submodule mountpoint,
+// threaded through to grand-recursions for symmetry with
+// `walkSubmoduleContents`.
 //
-// Source symlinks resolving inside `subWT` are rewritten to a SOURCE-
-// absolute path via `rewriteWalkSymlinkTarget`. The target tree only
-// contains the visited untracked leaves (submodule-tracked siblings are
-// silently skipped), so a verbatim relative target or a target-mountpoint-
-// rewritten absolute target would dangle whenever the link crosses the
-// tracked/untracked boundary inside the submodule WT.
+// Anchor decision: if target's path is absent, the entry anchors as a single
+// symlink (dir-symlink for directories, file-symlink for regulars). If
+// target already has content at the same path, recurse into directories;
+// for leaf files, target-tracked content produces `conflict/tracked` and
+// otherwise the source leaf is symlinked.
+//
+// Tracked-vs-untracked distinction inside the submodule WT is irrelevant:
+// submodule-tracked content lives only in source's initialised submodule
+// and target needs access to it. Source symlinks resolving inside `subWT`
+// are rewritten to a SOURCE-absolute path via `rewriteWalkSymlinkTarget`
+// so they remain valid no matter how target's tree was assembled.
 func (e *Engine) walkSubmoduleEntry(ctx context.Context, result *Result, prep prepared, c candidate, subWT, subRel, mountDstAbs, childRel, srcAbs, dstAbs string, srcInfo os.FileInfo, dryRun, force bool) int {
 	if srcInfo.Mode()&os.ModeSymlink != 0 {
 		linkTarget, err := os.Readlink(srcAbs)
@@ -451,11 +459,7 @@ func (e *Engine) walkSubmoduleEntry(ctx context.Context, result *Result, prep pr
 	}
 
 	if srcInfo.IsDir() {
-		// Anchor a dir-symlink where both the submodule subtree and the
-		// parent's target subtree are fully untracked.
-		srcTracked := e.isSubtreeTracked(ctx, prep.tracked, subWT, subRel)
-		dstTracked := e.isPathTracked(ctx, prep.tracked, prep.targetRoot, childRel) || e.isSubtreeTracked(ctx, prep.tracked, prep.targetRoot, childRel)
-		if !srcTracked && !dstTracked {
+		if _, err := os.Lstat(dstAbs); errors.Is(err, os.ErrNotExist) {
 			applySymlink(result, prep.targetRoot, childRel, srcAbs, dstAbs, dryRun, force)
 			return 1
 		}
@@ -496,11 +500,6 @@ func (e *Engine) walkSubmoduleEntry(ctx context.Context, result *Result, prep pr
 		return matched
 	}
 
-	// Leaf file: source-tracked uses the SUBMODULE's index; target-tracked
-	// uses the parent's. A submodule-tracked leaf produces no action.
-	if e.isPathTracked(ctx, prep.tracked, subWT, subRel) {
-		return 0
-	}
 	if !srcInfo.Mode().IsRegular() {
 		return 0
 	}
