@@ -602,3 +602,154 @@ func TestSubmoduleWalk_AnchorsTopLevelSubdirsAsSingleSymlinks(t *testing.T) {
 		t.Fatalf("packages/foo/bar.ts content via dir-symlink = %q, want %q", string(got), "BAR\n")
 	}
 }
+
+// TestSubmoduleWalk_IdempotentReapply — applying the same submodule-walk
+// pattern twice (with or without --force) must be a no-op on the second
+// run: the dir-symlinks anchored on the first apply must satisfy the
+// applySymlink same_link check, the walker must NOT descend through them
+// into the source tree, and no leaf actions or errors must surface for
+// paths inside an already-anchored subtree.
+func TestSubmoduleWalk_IdempotentReapply(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink and submodule semantics vary on Windows")
+	}
+
+	fx := setupSubmoduleFixture(t, "vendor/lib")
+
+	subWT := filepath.Join(fx.root, "vendor", "lib")
+	pkgDir := filepath.Join(subWT, "pkg")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatalf("mkdir pkg: %v", err)
+	}
+	writeFile(t, filepath.Join(pkgDir, "a.txt"), "A\n")
+	writeFile(t, filepath.Join(pkgDir, "b.txt"), "B\n")
+	runGit(t, subWT, "add", "pkg/a.txt", "pkg/b.txt")
+	runGit(t, subWT, "commit", "-q", "-m", "track pkg/")
+
+	mountTgt := filepath.Join(fx.wt, "vendor", "lib")
+	if err := os.MkdirAll(mountTgt, 0o755); err != nil {
+		t.Fatalf("mkdir target mountpoint: %v", err)
+	}
+
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "vendor/lib  symlink submodule-walk\n")
+
+	res1, code1, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if code1 != exitcode.OK {
+		t.Fatalf("first Apply exit code = %d, want %d (actions=%+v)", code1, exitcode.OK, res1.Actions)
+	}
+
+	pkgTgt := filepath.Join(mountTgt, "pkg")
+	pkgInfo, err := os.Lstat(pkgTgt)
+	if err != nil {
+		t.Fatalf("lstat target pkg/ after first Apply: %v", err)
+	}
+	if pkgInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("first Apply must anchor vendor/lib/pkg as a single dir-symlink, got mode=%v", pkgInfo.Mode())
+	}
+	gotLink, err := os.Readlink(pkgTgt)
+	if err != nil {
+		t.Fatalf("readlink pkg target: %v", err)
+	}
+	gotLinkCanon, err := filepath.EvalSymlinks(gotLink)
+	if err != nil {
+		t.Fatalf("eval first-apply link target %q: %v", gotLink, err)
+	}
+	wantLinkCanon, err := filepath.EvalSymlinks(pkgDir)
+	if err != nil {
+		t.Fatalf("eval source pkg dir: %v", err)
+	}
+	if filepath.Clean(gotLinkCanon) != filepath.Clean(wantLinkCanon) {
+		t.Fatalf("first Apply: pkg dir-symlink target mismatch: got %q want %q", gotLinkCanon, wantLinkCanon)
+	}
+
+	for _, force := range []bool{false, true} {
+		t.Run("force="+map[bool]string{false: "false", true: "true"}[force], func(t *testing.T) {
+			res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+				From:    "auto",
+				Include: testIncludeFile,
+				Force:   force,
+			})
+			if err != nil {
+				t.Fatalf("re-Apply: %v", err)
+			}
+			if code != exitcode.OK {
+				t.Fatalf("re-Apply exit code = %d, want %d (actions=%+v)", code, exitcode.OK, res.Actions)
+			}
+			if res.Summary.Errors != 0 {
+				t.Fatalf("re-Apply Summary.Errors = %d, want 0 (actions=%+v)", res.Summary.Errors, res.Actions)
+			}
+
+			for _, a := range res.Actions {
+				if a.Status == StatusError {
+					t.Fatalf("re-Apply produced an error action: %+v (all=%+v)", a, res.Actions)
+				}
+			}
+
+			for _, a := range res.Actions {
+				if a.Path == "vendor/lib/pkg/a.txt" || a.Path == "vendor/lib/pkg/b.txt" {
+					t.Fatalf("re-Apply must not descend into already-anchored vendor/lib/pkg/, got %+v (all=%+v)", a, res.Actions)
+				}
+				if strings.HasPrefix(a.Path, "vendor/lib/pkg/") {
+					t.Fatalf("re-Apply must not emit any action under already-anchored vendor/lib/pkg/, got %+v", a)
+				}
+			}
+
+			pkgAction := findAction(t, res.Actions, "vendor/lib/pkg")
+			if pkgAction.Op != "skip" || pkgAction.Status != StatusSameLink {
+				t.Fatalf("expected skip/%s at vendor/lib/pkg on re-Apply, got %+v (all=%+v)", StatusSameLink, pkgAction, res.Actions)
+			}
+
+			afterInfo, err := os.Lstat(pkgTgt)
+			if err != nil {
+				t.Fatalf("lstat target pkg/ after re-Apply: %v", err)
+			}
+			if afterInfo.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("re-Apply replaced dir-symlink with non-symlink, mode=%v", afterInfo.Mode())
+			}
+			gotAfter, err := os.Readlink(pkgTgt)
+			if err != nil {
+				t.Fatalf("readlink pkg after re-Apply: %v", err)
+			}
+			gotAfterCanon, err := filepath.EvalSymlinks(gotAfter)
+			if err != nil {
+				t.Fatalf("eval re-apply link target %q: %v", gotAfter, err)
+			}
+			wantAfterCanon, err := filepath.EvalSymlinks(pkgDir)
+			if err != nil {
+				t.Fatalf("eval pkg dir after re-Apply: %v", err)
+			}
+			if filepath.Clean(gotAfterCanon) != filepath.Clean(wantAfterCanon) {
+				t.Fatalf("re-Apply mutated pkg dir-symlink target: got %q want %q", gotAfterCanon, wantAfterCanon)
+			}
+
+			for _, leaf := range []string{"a.txt", "b.txt"} {
+				p := filepath.Join(mountTgt, "pkg", leaf)
+				inner := filepath.Join(pkgTgt, leaf)
+				resolved, err := filepath.EvalSymlinks(p)
+				if err != nil {
+					t.Fatalf("eval %s: %v", p, err)
+				}
+				wantResolved, err := filepath.EvalSymlinks(filepath.Join(pkgDir, leaf))
+				if err != nil {
+					t.Fatalf("eval source %s: %v", leaf, err)
+				}
+				if filepath.Clean(resolved) != filepath.Clean(wantResolved) {
+					t.Fatalf("leaf %s resolved to %q, want %q", leaf, resolved, wantResolved)
+				}
+				innerInfo, err := os.Lstat(inner)
+				if err != nil {
+					t.Fatalf("lstat inner %s: %v", inner, err)
+				}
+				if innerInfo.Mode()&os.ModeSymlink != 0 {
+					t.Fatalf("re-Apply created a per-leaf symlink at %s through the dir-symlink, mode=%v", inner, innerInfo.Mode())
+				}
+			}
+		})
+	}
+}

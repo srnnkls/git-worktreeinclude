@@ -459,7 +459,8 @@ func (e *Engine) walkSubmoduleEntry(ctx context.Context, result *Result, prep pr
 	}
 
 	if srcInfo.IsDir() {
-		if _, err := os.Lstat(dstAbs); errors.Is(err, os.ErrNotExist) {
+		dstInfo, err := os.Lstat(dstAbs)
+		if errors.Is(err, os.ErrNotExist) || (err == nil && dstInfo.Mode()&os.ModeSymlink != 0) {
 			applySymlink(result, prep.targetRoot, childRel, srcAbs, dstAbs, dryRun, force)
 			return 1
 		}
