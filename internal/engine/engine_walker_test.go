@@ -73,7 +73,10 @@ func TestWalker_SubmoduleMidWalk_EmitsDirSymlink(t *testing.T) {
 
 // TestWalker_SourceSymlinkMidWalk_RecreatesAtDestination — a symlink leaf
 // inside a partial-tracked dir is recreated as a symlink regardless of the
-// pattern's mode. Reuses rewriteAbsoluteLinkTarget for absolute-inside-source.
+// pattern's mode. Walk-mode rewrites the link target to the SOURCE-absolute
+// path whenever the link resolves inside the source root, because target's
+// tree does not necessarily mirror source's: tracked sibling subtrees the
+// walker silently skipped never materialize at target.
 func TestWalker_SourceSymlinkMidWalk_RecreatesAtDestination(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior varies on Windows")
@@ -87,7 +90,8 @@ func TestWalker_SourceSymlinkMidWalk_RecreatesAtDestination(t *testing.T) {
 	runGit(t, fx.root, "add", "mix/tracked.txt")
 	runGit(t, fx.root, "commit", "-q", "-m", "track mix/tracked.txt")
 
-	// A relative source-symlink inside the partial dir.
+	// A relative source-symlink inside the partial dir, crossing UP into the
+	// source root's tracked README.md (which the walker would silently skip).
 	if err := os.Symlink("../README.md", filepath.Join(fx.root, "mix", "to-readme")); err != nil {
 		t.Fatalf("create source symlink: %v", err)
 	}
@@ -113,8 +117,19 @@ func TestWalker_SourceSymlinkMidWalk_RecreatesAtDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink mix/to-readme: %v", err)
 	}
-	if got != "../README.md" {
-		t.Fatalf("expected verbatim relative target %q, got %q", "../README.md", got)
+	if !filepath.IsAbs(got) {
+		t.Fatalf("walk-mode must rewrite the relative target to a source-absolute path, got %q", got)
+	}
+	gotResolved, err := filepath.EvalSymlinks(filepath.Join(fx.wt, "mix", "to-readme"))
+	if err != nil {
+		t.Fatalf("eval recreated link: %v", err)
+	}
+	wantResolved, err := filepath.EvalSymlinks(filepath.Join(fx.root, "README.md"))
+	if err != nil {
+		t.Fatalf("eval source README.md: %v", err)
+	}
+	if filepath.Clean(gotResolved) != filepath.Clean(wantResolved) {
+		t.Fatalf("recreated symlink must resolve through the source README:\n  got:  %s\n  want: %s", gotResolved, wantResolved)
 	}
 	if a := findActionOptional(res.Actions, "mix/tracked.txt"); a.Op != "" {
 		t.Fatalf("tracked source leaf must produce no action, got %+v", a)
@@ -274,6 +289,92 @@ func TestWalker_DeepNestedAnchorDepth(t *testing.T) {
 	}
 	if a := findActionOptional(res.Actions, ".claude/skills/effect"); a.Op != "" {
 		t.Fatalf("partially-tracked effect dir must not anchor; got %+v", a)
+	}
+}
+
+// TestWalker_PartialDirSourceRelativeSymlinkRewrittenToSourceAbsolute — a
+// relative symlink inside a partial-tracked source dir that points across
+// into a source-tracked sibling must be rewritten to an absolute path
+// resolving inside the SOURCE root. The walker silently skips tracked
+// source leaves, so target's tree does NOT mirror source's; preserving
+// the verbatim relative link would dangle.
+func TestWalker_PartialDirSourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior varies on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+
+	// `tracked-area/x.txt` is tracked at source — the walker will skip it,
+	// so target never gets it. A relative symlink in `mix/` pointing at it
+	// would dangle if preserved verbatim.
+	if err := os.MkdirAll(filepath.Join(fx.root, "tracked-area"), 0o755); err != nil {
+		t.Fatalf("mkdir tracked-area: %v", err)
+	}
+	writeFile(t, filepath.Join(fx.root, "tracked-area", "x.txt"), "X\n")
+	runGit(t, fx.root, "add", "tracked-area/x.txt")
+	runGit(t, fx.root, "commit", "-q", "-m", "track tracked-area/x.txt")
+
+	// `setupEngineFixture` created the target worktree before this commit
+	// landed, so target's `feature` branch does not contain `tracked-area/`
+	// at all — exactly the "target tree does NOT mirror source" condition
+	// the bug requires.
+
+	// `mix/` is partial: one tracked anchor forces walker recursion, plus a
+	// relative symlink crossing into the tracked-area sibling.
+	if err := os.MkdirAll(filepath.Join(fx.root, "mix"), 0o755); err != nil {
+		t.Fatalf("mkdir mix: %v", err)
+	}
+	writeFile(t, filepath.Join(fx.root, "mix", "anchor.txt"), "ANCHOR\n")
+	runGit(t, fx.root, "add", "mix/anchor.txt")
+	runGit(t, fx.root, "commit", "-q", "-m", "track mix/anchor.txt")
+	if err := os.Symlink("../tracked-area/x.txt", filepath.Join(fx.root, "mix", "to-x")); err != nil {
+		t.Fatalf("create relative symlink: %v", err)
+	}
+
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "mix  symlink\n")
+
+	if _, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	} else if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+
+	// Precondition: target lacks the tracked sibling — proves the rewrite matters.
+	if _, err := os.Lstat(filepath.Join(fx.wt, "tracked-area", "x.txt")); err == nil {
+		t.Fatalf("precondition broken: target unexpectedly has tracked-area/x.txt")
+	}
+
+	recreated := filepath.Join(fx.wt, "mix", "to-x")
+	info, err := os.Lstat(recreated)
+	if err != nil {
+		t.Fatalf("lstat recreated link %s: %v", recreated, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("recreated path must be a symlink, got mode=%v", info.Mode())
+	}
+
+	got, err := os.Readlink(recreated)
+	if err != nil {
+		t.Fatalf("readlink %s: %v", recreated, err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("walk-mode must rewrite the relative target to an absolute source-rooted path, got %q", got)
+	}
+
+	gotResolved, err := filepath.EvalSymlinks(recreated)
+	if err != nil {
+		t.Fatalf("eval symlinks on recreated link: %v", err)
+	}
+	wantResolved, err := filepath.EvalSymlinks(filepath.Join(fx.root, "tracked-area", "x.txt"))
+	if err != nil {
+		t.Fatalf("eval symlinks on source tracked-area/x.txt: %v", err)
+	}
+	if filepath.Clean(gotResolved) != filepath.Clean(wantResolved) {
+		t.Fatalf("recreated symlink must resolve through the source root:\n  got:  %s\n  want: %s", gotResolved, wantResolved)
 	}
 }
 

@@ -238,13 +238,19 @@ func TestSubmoduleWalk_DefaultBehaviorUnchanged(t *testing.T) {
 	}
 }
 
-// TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToMountpoint — an absolute
-// symlink inside a source submodule WT must be rewritten so the recreated
-// link in the target points under the submodule's MOUNTPOINT, not under the
-// per-leaf destination. Concretely, `<subWT>/inner/foo -> <subWT>/data/x.txt`
-// must become `<wt>/vendor/lib/inner/foo -> <wt>/vendor/lib/data/x.txt`,
-// NOT `<wt>/vendor/lib/inner/foo/data/x.txt`.
-func TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToMountpoint(t *testing.T) {
+// TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToSourceAbsolute — an
+// absolute symlink inside a source submodule WT must be rewritten so the
+// recreated link in the target points at the SOURCE submodule's path, not
+// at the per-leaf destination AND not at the target mountpoint. Concretely,
+// `<subWT>/inner/foo -> <subWT>/data/x.txt` must become
+// `<wt>/vendor/lib/inner/foo -> <subWT>/data/x.txt`, NOT
+// `<wt>/vendor/lib/inner/foo/data/x.txt` and NOT
+// `<wt>/vendor/lib/inner/foo -> <wt>/vendor/lib/data/x.txt`.
+//
+// The walk-mode contract is: target's tree only contains the visited
+// untracked leaves, so any link target inside `subWT` resolves reliably
+// only via the source path.
+func TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToSourceAbsolute(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink and submodule semantics vary on Windows")
 	}
@@ -299,18 +305,20 @@ func TestSubmoduleWalk_SourceAbsoluteSymlinkRewrittenToMountpoint(t *testing.T) 
 	if !filepath.IsAbs(got) {
 		t.Fatalf("expected rewritten absolute target, got %q", got)
 	}
-	// The recreated link must point at the per-mountpoint target path —
-	// `<wt>/vendor/lib/data/x.txt` — NOT the buggy per-leaf path
-	// `<wt>/vendor/lib/inner/foo/data/x.txt`. Compare via EvalSymlinks-style
-	// canonicalization on both the got link target and the expected target
-	// to absorb the macOS `/var → /private/var` mismatch between git's
-	// `rev-parse --show-toplevel` output and `os.MkdirTemp`'s prefix.
+	// The recreated link must point at the SOURCE submodule's
+	// `<subWT>/data/x.txt` — NOT the buggy per-leaf path
+	// `<wt>/vendor/lib/inner/foo/data/x.txt` and NOT a target-mountpoint-
+	// rooted `<wt>/vendor/lib/data/x.txt` (which would dangle whenever
+	// the submodule walker silently skipped the tracked sibling).
+	// Compare via EvalSymlinks to absorb the macOS `/var → /private/var`
+	// mismatch between git's `rev-parse --show-toplevel` output and
+	// `os.MkdirTemp`'s prefix.
 	gotCanon, err := filepath.EvalSymlinks(filepath.Dir(got))
 	if err != nil {
 		t.Fatalf("eval parent of recreated link target %q: %v", got, err)
 	}
 	gotCanon = filepath.Join(gotCanon, filepath.Base(got))
-	wantCanon, err := filepath.EvalSymlinks(filepath.Join(fx.wt, "vendor", "lib", "data"))
+	wantCanon, err := filepath.EvalSymlinks(filepath.Join(subWT, "data"))
 	if err != nil {
 		t.Fatalf("eval expected target dir: %v", err)
 	}
@@ -378,5 +386,100 @@ func TestSubmoduleWalk_SubmoduleTrackedSetIsIndependent(t *testing.T) {
 		if info.Mode()&os.ModeSymlink != 0 {
 			t.Fatalf("walker created a symlink for a submodule-tracked file (%v)", info.Mode())
 		}
+	}
+}
+
+// TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute — a
+// relative symlink inside a source submodule that crosses into a
+// source-tracked sibling must be rewritten to an absolute path resolving
+// inside the SOURCE submodule WT. The submodule walker silently skips
+// submodule-tracked leaves, so the target tree does NOT mirror the
+// submodule's tree; preserving the verbatim relative target would resolve
+// through paths that target never materializes.
+//
+// Reproducer drawn from the user's `effect/` submodule report: an untracked
+// fixture file links across into a tracked sibling subtree.
+func TestSubmoduleWalk_SourceRelativeSymlinkRewrittenToSourceAbsolute(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink and submodule semantics vary on Windows")
+	}
+
+	fx := setupSubmoduleFixture(t, "vendor/lib")
+
+	subWT := filepath.Join(fx.root, "vendor", "lib")
+	dataDir := filepath.Join(subWT, "data")
+	innerDir := filepath.Join(subWT, "inner")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	if err := os.MkdirAll(innerDir, 0o755); err != nil {
+		t.Fatalf("mkdir inner: %v", err)
+	}
+
+	// `data/x.txt` is tracked in the SUBMODULE'S index — the walker will
+	// silently skip it, leaving the target without `vendor/lib/data/x.txt`.
+	writeFile(t, filepath.Join(dataDir, "x.txt"), "X\n")
+	// Sentinel inside `inner/` so the dir is partial-tracked; the walker
+	// must recurse and visit the relative symlink rather than anchor.
+	writeFile(t, filepath.Join(innerDir, "tracked.txt"), "T\n")
+	runGit(t, subWT, "add", "data/x.txt", "inner/tracked.txt")
+	runGit(t, subWT, "commit", "-q", "-m", "track data/x.txt and inner/tracked.txt")
+
+	// Untracked relative symlink crossing the tracked/untracked boundary.
+	if err := os.Symlink("../data/x.txt", filepath.Join(innerDir, "foo")); err != nil {
+		t.Fatalf("create relative symlink: %v", err)
+	}
+
+	mountTgt := filepath.Join(fx.wt, "vendor", "lib")
+	if err := os.MkdirAll(mountTgt, 0o755); err != nil {
+		t.Fatalf("mkdir target mountpoint: %v", err)
+	}
+
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "vendor/lib  symlink submodule-walk\n")
+
+	if _, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	} else if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+
+	// Target must NOT have the tracked sibling — the walker silently skipped
+	// it, which is precisely why a verbatim relative link would be broken.
+	if _, err := os.Lstat(filepath.Join(mountTgt, "data", "x.txt")); err == nil {
+		t.Fatalf("precondition broken: target unexpectedly has data/x.txt; the walker was supposed to skip it")
+	}
+
+	recreated := filepath.Join(mountTgt, "inner", "foo")
+	info, err := os.Lstat(recreated)
+	if err != nil {
+		t.Fatalf("lstat recreated link %s: %v", recreated, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("recreated path must be a symlink, got mode=%v", info.Mode())
+	}
+
+	got, err := os.Readlink(recreated)
+	if err != nil {
+		t.Fatalf("readlink %s: %v", recreated, err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("walk-mode must rewrite the relative target to an absolute source-rooted path, got %q", got)
+	}
+
+	// The recreated link must resolve to the SOURCE submodule's data/x.txt
+	// because the source is the only side that actually has the file.
+	gotResolved, err := filepath.EvalSymlinks(recreated)
+	if err != nil {
+		t.Fatalf("eval symlinks on recreated link: %v", err)
+	}
+	wantResolved, err := filepath.EvalSymlinks(filepath.Join(subWT, "data", "x.txt"))
+	if err != nil {
+		t.Fatalf("eval symlinks on source data/x.txt: %v", err)
+	}
+	if filepath.Clean(gotResolved) != filepath.Clean(wantResolved) {
+		t.Fatalf("recreated symlink must resolve through the source submodule:\n  got:  %s\n  want: %s", gotResolved, wantResolved)
 	}
 }
