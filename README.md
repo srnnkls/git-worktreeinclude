@@ -127,11 +127,10 @@ Submodules listed in `.gitmodules` (gitlink entries in the index) bypass the tra
 
 ### Source symlinks
 
-If a matched source path is itself a symlink, it is recreated at the destination as a symlink with the same link semantics, regardless of any `copy`/`symlink` attribute on the pattern:
+If a matched source path is itself a symlink, it is recreated at the destination as a symlink, regardless of any `copy`/`symlink` attribute on the pattern. The same rule applies at the pattern root and at every depth of a walked subtree (including `submodule-walk`):
 
-- Relative link targets are preserved verbatim (`.codex -> .claude` in source becomes `.codex -> .claude` in target).
-- Absolute link targets pointing inside the source worktree are rewritten to the equivalent path under the target worktree, so the recreated link does not reach back into the source.
-- Absolute link targets pointing outside the source worktree are preserved verbatim.
+- A source-side symlink whose target resolves **inside the source worktree** — whether the original target is written as a relative path (`.codex -> .claude`) or an absolute path (`/abs/source/.codex -> /abs/source/.claude`) — is rewritten at the destination to that **source-absolute** path. The recreated link in the target worktree resolves through to source's canonical content (e.g. target's `.codex` reads as `/abs/source/.claude`), which always exists regardless of how the target worktree was assembled. This makes the dotfile-alias pattern (`.codex -> .claude`, meaning "treat .codex as an alias for the canonical .claude") work uniformly across worktrees.
+- A source-side symlink whose target resolves **outside the source worktree** (relative or absolute) is preserved verbatim. Cross-boundary links are the user's responsibility — if the external target moves or disappears, the link will dangle.
 
 Conflict, same-link, dry-run, and `--force` semantics for recreated source-symlinks match symlink mode above.
 

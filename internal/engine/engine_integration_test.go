@@ -119,7 +119,7 @@ func TestEngineApplySkipsSameContent(t *testing.T) {
 	}
 }
 
-func TestEngineApplyRecreatesRelativeSourceSymlink(t *testing.T) {
+func TestEngineApplyRewritesRelativeInSourceSymlinkToSourceAbsolute(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior and permissions vary on Windows")
 	}
@@ -162,12 +162,19 @@ func TestEngineApplyRecreatesRelativeSourceSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink: %v", err)
 	}
-	if got != ".env.local" {
-		t.Fatalf("expected verbatim relative target %q, got %q", ".env.local", got)
+	if !filepath.IsAbs(got) {
+		t.Fatalf("relative-into-source target must be rewritten to source-absolute, got relative %q", got)
+	}
+	wantSource := filepath.Join(fx.root, ".env.local")
+	if !sameFileWeak(t, got, wantSource) && !sameFile(t, dst, wantSource) {
+		t.Fatalf("recreated link should resolve to source's .env.local (%q), readlink=%q", wantSource, got)
+	}
+	if sameFileWeak(t, got, filepath.Join(fx.wt, ".env.local")) {
+		t.Fatalf("recreated link must NOT be rewritten under target worktree, readlink=%q", got)
 	}
 }
 
-func TestEngineApplyRewritesAbsoluteInSourceSymlink(t *testing.T) {
+func TestEngineApplyRewritesAbsoluteInSourceSymlinkToSourceAbsolute(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink behavior and permissions vary on Windows")
 	}
@@ -202,15 +209,14 @@ func TestEngineApplyRewritesAbsoluteInSourceSymlink(t *testing.T) {
 		t.Fatalf("readlink: %v", err)
 	}
 	if !filepath.IsAbs(got) {
-		t.Fatalf("expected rewritten absolute target, got %q", got)
+		t.Fatalf("recreated link target must be absolute, got %q", got)
 	}
-	// Link must resolve into the target worktree's .env.local, not the
-	// source worktree's, so the worktree stays self-contained.
-	if !sameFile(t, dst, filepath.Join(fx.wt, ".env.local")) {
-		t.Fatalf("recreated link should resolve to target's .env.local, readlink=%q", got)
+	wantSource := filepath.Join(fx.root, ".env.local")
+	if !sameFileWeak(t, got, wantSource) && !sameFile(t, dst, wantSource) {
+		t.Fatalf("recreated link should resolve to source's .env.local (%q), readlink=%q", wantSource, got)
 	}
-	if sameFileWeak(t, got, absInside) {
-		t.Fatalf("recreated link should not point back into source, readlink=%q", got)
+	if sameFileWeak(t, got, filepath.Join(fx.wt, ".env.local")) {
+		t.Fatalf("recreated link must NOT be rewritten under target worktree, readlink=%q", got)
 	}
 }
 
@@ -304,7 +310,9 @@ func TestEngineApplyRecreatesSymlinkSameSkip(t *testing.T) {
 	if err := os.Symlink(".env.local", filepath.Join(fx.root, ".env")); err != nil {
 		t.Fatalf("create source symlink: %v", err)
 	}
-	if err := os.Symlink(".env.local", filepath.Join(fx.wt, ".env")); err != nil {
+	// Pre-existing target link must match the source-anchored form the
+	// engine writes: an absolute path into source's .env.local.
+	if err := os.Symlink(filepath.Join(fx.root, ".env.local"), filepath.Join(fx.wt, ".env")); err != nil {
 		t.Fatalf("create matching dst symlink: %v", err)
 	}
 
@@ -372,12 +380,17 @@ func TestEngineApplyRecreatesSymlinkConflictAndForce(t *testing.T) {
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf(".env should be a symlink after --force, got mode=%v", info.Mode())
 	}
-	got, err := os.Readlink(filepath.Join(fx.wt, ".env"))
+	dst := filepath.Join(fx.wt, ".env")
+	got, err := os.Readlink(dst)
 	if err != nil {
 		t.Fatalf("readlink: %v", err)
 	}
-	if got != ".env.local" {
-		t.Fatalf("expected verbatim relative target, got %q", got)
+	if !filepath.IsAbs(got) {
+		t.Fatalf("recreated link target must be source-absolute, got %q", got)
+	}
+	wantSource := filepath.Join(fx.root, ".env.local")
+	if !sameFileWeak(t, got, wantSource) && !sameFile(t, dst, wantSource) {
+		t.Fatalf("recreated link should resolve to source's .env.local (%q), readlink=%q", wantSource, got)
 	}
 }
 

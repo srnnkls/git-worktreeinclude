@@ -232,7 +232,7 @@ func (e *Engine) executeCandidate(ctx context.Context, result *Result, prep prep
 
 	leavesBefore := len(result.Actions)
 
-	matched, recursed := e.walk(ctx, result, prep, c, c.rel, srcPath, dstPath, srcInfo, dryRun, force, false)
+	matched, recursed := e.walk(ctx, result, prep, c, c.rel, srcPath, dstPath, srcInfo, dryRun, force)
 
 	// `expand/walked` rolls up the per-leaf actions emitted under this
 	// candidate so JSON consumers can correlate leaves back to their
@@ -267,14 +267,14 @@ func (e *Engine) executeCandidate(ctx context.Context, result *Result, prep prep
 // a rollup). Leaf actions are appended directly to result.Actions; the
 // rollup itself is emitted by the caller, not by walk.
 //
-// `inWalk` is true when invoked from `walkDir` recursion (i.e., descending
-// past the pattern root). At the pattern root the target's tree is expected
-// to mirror source's, so absolute-into-source links are rewritten target-
-// relative via `rewriteAbsoluteLinkTarget`. Mid-walk, target only contains
-// the visited untracked leaves, so a source-symlink's target is rewritten
-// to a SOURCE-absolute path via `rewriteWalkSymlinkTarget` whenever it
-// resolves inside the source root being walked.
-func (e *Engine) walk(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, srcInfo os.FileInfo, dryRun, force bool, inWalk bool) (int, bool) {
+// Source symlinks — at the pattern root or mid-walk — are anchored against
+// the source root via `rewriteWalkSymlinkTarget`. A relative target that
+// resolves inside source becomes a source-absolute link so the dotfile-alias
+// pattern (`.codex -> .claude`) resolves through to source's canonical
+// content instead of target's separate tree. External targets (outside the
+// source root) are preserved verbatim — cross-boundary links are the user's
+// responsibility.
+func (e *Engine) walk(ctx context.Context, result *Result, prep prepared, c candidate, rel, srcAbs, dstAbs string, srcInfo os.FileInfo, dryRun, force bool) (int, bool) {
 	_, isSubmodule := prep.submodulePaths[rel]
 
 	// 1. Submodule path: applies at every depth.
@@ -300,11 +300,7 @@ func (e *Engine) walk(ctx context.Context, result *Result, prep prepared, c cand
 			result.Summary.Errors++
 			return 1, false
 		}
-		if inWalk {
-			linkTarget = rewriteWalkSymlinkTarget(linkTarget, srcAbs, prep.sourceRoot)
-		} else {
-			linkTarget = rewriteAbsoluteLinkTarget(linkTarget, prep.sourceRoot, prep.targetRoot)
-		}
+		linkTarget = rewriteWalkSymlinkTarget(linkTarget, srcAbs, prep.sourceRoot)
 		applySymlink(result, prep.targetRoot, rel, linkTarget, dstAbs, dryRun, force)
 		return 1, false
 	}
@@ -368,7 +364,7 @@ func (e *Engine) walkDir(ctx context.Context, result *Result, prep prepared, c c
 			continue
 		}
 
-		childMatched, _ := e.walk(ctx, result, prep, c, childRel, childSrc, childDst, childInfo, dryRun, force, true)
+		childMatched, _ := e.walk(ctx, result, prep, c, childRel, childSrc, childDst, childInfo, dryRun, force)
 		matched += childMatched
 	}
 	return matched, true
@@ -1363,45 +1359,14 @@ func symlinkPointsTo(dstPath, wantLinkTarget string) (bool, error) {
 	return false, nil
 }
 
-// rewriteAbsoluteLinkTarget rewrites absolute link targets that lie inside
-// the source root to the equivalent path under the target root, so a
-// recreated link does not reach back into the source worktree. Relative
-// targets and absolute targets pointing outside the source root are
-// returned unchanged. Both sides are canonicalized (e.g. /var vs
-// /private/var on macOS) before comparison.
-//
-// Used at the pattern root, where target's tree is expected to mirror
-// source's. Walk-mode recursion uses `rewriteWalkSymlinkTarget` instead.
-func rewriteAbsoluteLinkTarget(linkTarget, sourceRoot, targetRoot string) string {
-	if !filepath.IsAbs(linkTarget) {
-		return linkTarget
-	}
-	canonSource := canonicalPath(sourceRoot)
-	canonTarget := canonicalPath(linkTarget)
-	rel, err := filepath.Rel(canonSource, canonTarget)
-	if err != nil {
-		return linkTarget
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return linkTarget
-	}
-	return filepath.Join(targetRoot, rel)
-}
-
-// rewriteWalkSymlinkTarget is the walk-mode counterpart to
-// `rewriteAbsoluteLinkTarget`. When the walker recreates a source symlink
-// mid-recursion, the target tree only contains the visited untracked
-// leaves — tracked siblings the walker silently skipped never materialize.
-// Preserving the original target verbatim (relative) or rewriting it
-// target-relative (absolute-into-source) leaves the recreated link dangling
-// whenever it crosses the tracked/untracked boundary inside `walkRoot`.
-//
-// The fix: resolve the link's effective absolute target against the
-// directory holding the source symlink, then if it lands inside `walkRoot`
-// write the recreated link as that SOURCE-absolute path so it always
-// resolves to the file that actually exists (in source). Targets resolving
-// outside `walkRoot` are preserved verbatim — those are the user's
-// responsibility to keep working.
+// rewriteWalkSymlinkTarget anchors a source-side symlink against the source
+// root. Resolves the link's effective absolute target (relative targets
+// resolve against the directory holding the source symlink), then if it
+// lands inside `walkRoot` returns that SOURCE-absolute path so the
+// recreated link at the target worktree resolves through to source's
+// content — which always exists, regardless of how target's tree was
+// assembled. Targets resolving outside `walkRoot` are returned verbatim;
+// cross-boundary links are the user's responsibility to keep working.
 func rewriteWalkSymlinkTarget(linkTarget, srcAbs, walkRoot string) string {
 	var resolved string
 	if filepath.IsAbs(linkTarget) {

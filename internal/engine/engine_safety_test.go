@@ -482,6 +482,148 @@ func TestSafety_PartiallyTrackedDirSymlinkWalksAndAnchorsLeaves(t *testing.T) {
 	}
 }
 
+// TestSymlinkSource_PatternRootRelativeInsideSource_RewritesToSourceAbsolute —
+// a source-side symlink whose relative target resolves inside the source root
+// is recreated at target as a source-absolute path. Dotfile-alias use case:
+// `.codex -> .claude` in source must produce target's `.codex` resolving
+// through to source's `.claude`, not to target's separate `.claude`.
+func TestSymlinkSource_PatternRootRelativeInsideSource_RewritesToSourceAbsolute(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior varies on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	writeFile(t, filepath.Join(fx.root, ".gitignore"), ".env\n.env.local\ntarget.txt\nalias\n")
+	writeFile(t, filepath.Join(fx.root, "target.txt"), "CANONICAL\n")
+	if err := os.Symlink("target.txt", filepath.Join(fx.root, "alias")); err != nil {
+		t.Fatalf("create relative source symlink alias -> target.txt: %v", err)
+	}
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "alias  symlink\n")
+
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+	if action := findAction(t, res.Actions, "alias"); action.Op != "symlink" || action.Status != "done" {
+		t.Fatalf("expected symlink/done for alias, got %+v", action)
+	}
+
+	dst := filepath.Join(fx.wt, "alias")
+	info, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatalf("lstat alias: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("alias should be a symlink, got mode=%v", info.Mode())
+	}
+	got, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatalf("readlink alias: %v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("recreated link target must be source-absolute, got relative %q", got)
+	}
+	wantSource := filepath.Join(fx.root, "target.txt")
+	if !sameFileWeak(t, got, wantSource) && !sameFile(t, dst, wantSource) {
+		t.Fatalf("recreated link should resolve to source's target.txt (%q), readlink=%q", wantSource, got)
+	}
+	if sameFileWeak(t, got, filepath.Join(fx.wt, "target.txt")) {
+		t.Fatalf("recreated link must NOT be rewritten under target worktree, readlink=%q", got)
+	}
+}
+
+// TestSymlinkSource_PatternRootAbsoluteInsideSource_RewritesToSourceAbsolute —
+// a source-side symlink whose absolute target points inside the source root
+// is recreated at target as a source-absolute path (unchanged anchor, but
+// the contract is the unified source-anchor rule, not a target-rewrite).
+func TestSymlinkSource_PatternRootAbsoluteInsideSource_RewritesToSourceAbsolute(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior varies on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	writeFile(t, filepath.Join(fx.root, ".gitignore"), ".env\n.env.local\ntarget.txt\nalias\n")
+	writeFile(t, filepath.Join(fx.root, "target.txt"), "CANONICAL\n")
+	absInside := filepath.Join(fx.root, "target.txt")
+	if err := os.Symlink(absInside, filepath.Join(fx.root, "alias")); err != nil {
+		t.Fatalf("create absolute-inside-source symlink alias -> %s: %v", absInside, err)
+	}
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "alias  symlink\n")
+
+	res, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+	if action := findAction(t, res.Actions, "alias"); action.Op != "symlink" || action.Status != "done" {
+		t.Fatalf("expected symlink/done for alias, got %+v", action)
+	}
+
+	dst := filepath.Join(fx.wt, "alias")
+	got, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatalf("readlink alias: %v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("recreated link target must be source-absolute, got relative %q", got)
+	}
+	wantSource := filepath.Join(fx.root, "target.txt")
+	if !sameFileWeak(t, got, wantSource) && !sameFile(t, dst, wantSource) {
+		t.Fatalf("recreated link should resolve to source's target.txt (%q), readlink=%q", wantSource, got)
+	}
+	if sameFileWeak(t, got, filepath.Join(fx.wt, "target.txt")) {
+		t.Fatalf("recreated link must NOT be rewritten under target worktree, readlink=%q", got)
+	}
+}
+
+// TestSymlinkSource_PatternRootOutsideSource_PreservedVerbatim — an external
+// absolute symlink target (resolving outside the source root) is preserved
+// verbatim. Cross-boundary links are the user's responsibility.
+func TestSymlinkSource_PatternRootOutsideSource_PreservedVerbatim(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior varies on Windows")
+	}
+
+	fx := setupEngineFixture(t)
+	writeFile(t, filepath.Join(fx.root, ".gitignore"), ".env\n.env.local\nexternal\n")
+	external := "/etc/hosts"
+	if err := os.Symlink(external, filepath.Join(fx.root, "external")); err != nil {
+		t.Fatalf("create external symlink: %v", err)
+	}
+	writeFile(t, filepath.Join(fx.root, testIncludeFile), "external  symlink\n")
+
+	_, code, err := NewEngine().Apply(context.Background(), fx.wt, ApplyOptions{
+		From:    "auto",
+		Include: testIncludeFile,
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if code != exitcode.OK {
+		t.Fatalf("Apply exit code = %d, want %d", code, exitcode.OK)
+	}
+
+	dst := filepath.Join(fx.wt, "external")
+	got, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatalf("readlink external: %v", err)
+	}
+	if got != external {
+		t.Fatalf("external symlink target should be preserved verbatim: want %q, got %q", external, got)
+	}
+}
+
 // findActionOptional returns the matching action or a zero Action if absent.
 // Unlike findAction it does not fail the test.
 func findActionOptional(actions []Action, path string) Action {
